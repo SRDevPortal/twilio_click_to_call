@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import frappe
+from frappe import _
+from frappe.model.document import Document
+
+from twilio_click_to_call.services.numbers import normalize_phone_number
+from twilio_click_to_call.services.settings import get_caller_ids, get_settings
+
+
+class TwilioUserMapping(Document):
+    def validate(self):
+        settings = get_settings()
+        default_country_code = settings.default_country_code or "+91"
+        self.agent_mobile = normalize_phone_number(self.agent_mobile, default_country_code=default_country_code)
+        if self.caller_id:
+            self.caller_id = normalize_phone_number(self.caller_id, default_country_code=default_country_code)
+            if self.caller_id not in get_caller_ids(settings):
+                frappe.throw(_("Twilio Number must be one of the Caller IDs configured in Twilio Settings."))
+
+        if self.get("whatsapp_channel_account"):
+            channel = frappe.db.get_value(
+                "Chat Channel Account",
+                self.whatsapp_channel_account,
+                ["channel_type", "is_active"],
+                as_dict=True,
+            )
+            if not channel or channel.channel_type != "Interakt" or not channel.is_active:
+                frappe.throw(_("Interakt Channel Account must be an active Interakt account."))
+
+        self.availability_status = self.availability_status or "Available"
+        self.queue_source = self.queue_source or "CRM Lead"
+        if self.queue_source not in {"CRM Lead", "Patient", "CRM Lead and Patient", "Patient Encounter", "Issue", "Discontinued"}:
+            frappe.throw(_("Queue Source must be CRM Lead, Patient, CRM Lead and Patient, Patient Encounter, Issue, or Discontinued."))
+        if self.queue_source in {"Patient", "CRM Lead and Patient"}:
+            departments = _split_values(self.get("sr_medical_departments"))
+            followup_ids = _split_values(self.get("sr_followup_ids"))
+            diseases = _split_values(self.get("sr_dpt_diseases"))
+            languages = _split_values(self.get("sr_dpt_languages"))
+            if self.sr_medical_department and self.sr_medical_department not in departments:
+                departments.insert(0, self.sr_medical_department)
+            if self.sr_followup_id not in (None, "") and str(self.sr_followup_id) not in followup_ids:
+                followup_ids.insert(0, str(self.sr_followup_id))
+            if self.get("sr_dpt_disease") and self.sr_dpt_disease not in diseases:
+                diseases.insert(0, self.sr_dpt_disease)
+            if self.get("sr_dpt_language") and self.sr_dpt_language not in languages:
+                languages.insert(0, self.sr_dpt_language)
+            if not departments:
+                frappe.throw(_("At least one Department is required when Queue Source is Patient."))
+            if not followup_ids:
+                frappe.throw(_("At least one Follow up ID is required when Queue Source is Patient."))
+            if "Regional" in departments and not diseases:
+                frappe.throw(_("At least one Disease is required when Department includes Regional."))
+            if "Regional" in departments and not languages:
+                frappe.throw(_("At least one Language is required when Department includes Regional."))
+            self.sr_medical_department = departments[0]
+            self.sr_medical_departments = "\n".join(departments)
+            self.sr_followup_id = followup_ids[0]
+            self.sr_followup_ids = "\n".join(followup_ids)
+            self.sr_dpt_disease = diseases[0] if diseases else ""
+            self.sr_dpt_diseases = "\n".join(diseases)
+            self.sr_dpt_language = languages[0] if languages else ""
+            self.sr_dpt_languages = "\n".join(languages)
+        else:
+            self.sr_medical_department = ""
+            self.sr_followup_id = ""
+            self.sr_medical_departments = ""
+            self.sr_followup_ids = ""
+            self.sr_dpt_disease = ""
+            self.sr_dpt_diseases = ""
+            self.sr_dpt_language = ""
+            self.sr_dpt_languages = ""
+        self.fallback_users = "\n".join(_split_values(self.get("fallback_users"), first=self.get("fallback_user")))
+        if not self.fallback_user and self.fallback_users:
+            self.fallback_user = _split_values(self.fallback_users)[0]
+        if self.accept_calls is None:
+            self.accept_calls = 1
+        if self.auto_available_after_call is None:
+            self.auto_available_after_call = 1
+        if not self.last_status_at:
+            self.last_status_at = frappe.utils.now()
+        if self.enforce_working_hours and not (self.working_hours_start and self.working_hours_end):
+            frappe.throw(_("Working Hours Start and End are required when working hours are enforced."))
+
+        if self.enabled and not self.agent_mobile:
+            frappe.throw(_("Agent Mobile is required for an enabled Twilio user mapping."))
+
+    def on_update(self):
+        if self.enabled and self.user and frappe.db.exists("Role", "Twilio Agent"):
+            frappe.get_doc("User", self.user).add_roles("Twilio Agent")
+        sync_reciprocal_fallback_users(self)
+
+
+def mark_user_offline_on_logout(login_manager=None) -> None:
+    user = getattr(getattr(login_manager, "user", None), "name", None) or getattr(login_manager, "user", None) or frappe.session.user
+    if not user or user == "Guest":
+        return
+    mapping_name = frappe.db.get_value("Twilio User Mapping", {"user": user, "enabled": 1}, "name")
+    if not mapping_name:
+        return
+    frappe.db.set_value(
+        "Twilio User Mapping",
+        mapping_name,
+        {
+            "availability_status": "Offline",
+            "accept_calls": 0,
+            "last_status_at": frappe.utils.now(),
+        },
+        update_modified=True,
+    )
+
+
+def _split_values(value: str | None, first: str | None = None) -> list[str]:
+    values = []
+    seen = set()
+    for raw in [first or "", value or ""]:
+        for row in str(raw).replace(",", "\n").splitlines():
+            row = row.strip()
+            if row and row not in seen:
+                values.append(row)
+                seen.add(row)
+    return values
+
+
+def sync_reciprocal_fallback_users(doc: TwilioUserMapping) -> None:
+    source_user = (doc.user or "").strip()
+    if not source_user:
+        return
+
+    for fallback_user in _split_values(doc.get("fallback_users"), first=doc.get("fallback_user")):
+        if fallback_user == source_user:
+            continue
+        fallback_mapping = frappe.db.get_value(
+            "Twilio User Mapping",
+            {"user": fallback_user},
+            ["name", "fallback_user", "fallback_users"],
+            as_dict=True,
+        )
+        if not fallback_mapping:
+            continue
+
+        reciprocal_users = _split_values(
+            fallback_mapping.get("fallback_users"),
+            first=fallback_mapping.get("fallback_user"),
+        )
+        if source_user in reciprocal_users:
+            continue
+
+        reciprocal_users.append(source_user)
+        frappe.db.set_value(
+            "Twilio User Mapping",
+            fallback_mapping.name,
+            {
+                "fallback_user": fallback_mapping.get("fallback_user") or reciprocal_users[0],
+                "fallback_users": "\n".join(reciprocal_users),
+            },
+            update_modified=True,
+        )
+
+
+@frappe.whitelist()
+def get_team_leader(team: str | None = None) -> str:
+    if "System Manager" not in frappe.get_roles() and "Twilio Manager" not in frappe.get_roles():
+        frappe.throw(_("Not permitted."))
+    team = (team or "").strip()
+    if not team or not frappe.db.exists("DocType", "Team"):
+        return ""
+
+    filters = {"team_name": team}
+    if not frappe.db.exists("Team", filters):
+        filters = {"name": team}
+    return frappe.db.get_value("Team", filters, "team_lead") or ""

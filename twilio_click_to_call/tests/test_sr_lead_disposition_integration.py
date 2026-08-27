@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from pathlib import Path
+import unittest
+
+
+APP = Path(__file__).resolve().parents[1]
+LEAD_DISPOSITION = APP / "services" / "lead_disposition.py"
+DISPOSITION = APP / "services" / "disposition.py"
+DISPOSITION_API = APP / "api" / "disposition.py"
+AI = APP / "services" / "ai.py"
+SETTINGS = APP / "services" / "settings.py"
+TWILIO_SETTINGS = APP / "twilio_click_to_call" / "doctype" / "twilio_settings" / "twilio_settings.py"
+TWILIO_SETTINGS_JSON = APP / "twilio_click_to_call" / "doctype" / "twilio_settings" / "twilio_settings.json"
+TWILIO_SETTINGS_JS = APP / "public" / "js" / "twilio_settings.js"
+CONSOLE = APP / "api" / "console.py"
+HOOKS = APP / "hooks.py"
+INSTALL = APP / "install.py"
+PATCHES = APP / "patches.txt"
+DISPOSITION_CACHE_PATCH = APP / "patches" / "v1_0" / "remove_runtime_call_log_disposition_property_setters.py"
+
+
+class TestSRLeadDispositionIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.lead_disposition = LEAD_DISPOSITION.read_text(encoding="utf-8")
+        cls.disposition = DISPOSITION.read_text(encoding="utf-8")
+        cls.disposition_api = DISPOSITION_API.read_text(encoding="utf-8")
+        cls.ai = AI.read_text(encoding="utf-8")
+        cls.settings = SETTINGS.read_text(encoding="utf-8")
+        cls.twilio_settings = TWILIO_SETTINGS.read_text(encoding="utf-8")
+        cls.twilio_settings_json = TWILIO_SETTINGS_JSON.read_text(encoding="utf-8")
+        cls.twilio_settings_js = TWILIO_SETTINGS_JS.read_text(encoding="utf-8")
+        cls.console = CONSOLE.read_text(encoding="utf-8")
+        cls.hooks = HOOKS.read_text(encoding="utf-8")
+        cls.install = INSTALL.read_text(encoding="utf-8")
+        cls.patches = PATCHES.read_text(encoding="utf-8")
+        cls.disposition_cache_patch = DISPOSITION_CACHE_PATCH.read_text(encoding="utf-8")
+
+    def test_sr_lead_disposition_is_source_of_truth(self):
+        self.assertIn('SR_LEAD_DISPOSITION = "SR Lead Disposition"', self.lead_disposition)
+        self.assertIn("get_lead_disposition_options", self.settings)
+        self.assertIn("get_lead_disposition_options(reference_doctype, reference_name, lead_status)", self.settings)
+        self.assertIn("get_lead_disposition_context", self.console)
+        self.assertIn("get_lead_status_options", self.lead_disposition)
+        self.assertIn("lead_status: str | None = None", self.lead_disposition)
+
+    def test_manual_disposition_syncs_to_crm_lead(self):
+        self.assertIn("sync_call_disposition_to_lead", self.disposition)
+        self.assertIn("reference_doctype=doc.reference_doctype", self.disposition)
+        self.assertIn("reference_name=doc.reference_name", self.disposition)
+        self.assertIn("lead_status=lead_status", self.disposition)
+        self.assertNotIn("Call notes are required", self.disposition)
+        self.assertIn('notes: str = ""', self.disposition_api)
+        self.assertIn('notes: str = ""', self.disposition)
+        self.assertIn("lead_sync", self.disposition)
+
+    def test_twilio_settings_ai_options_sync_from_sr_lead_disposition(self):
+        self.assertIn("self.sync_ai_disposition_options()", self.twilio_settings)
+        self.assertIn("def get_sr_lead_disposition_options", self.twilio_settings)
+        self.assertIn("get_lead_disposition_rows()", self.twilio_settings)
+        self.assertIn("@frappe.whitelist()", self.twilio_settings)
+        self.assertIn("sync_ai_disposition_options", self.twilio_settings_js)
+        self.assertIn('"read_only": 1', self.twilio_settings_json)
+        self.assertIn("Synced from active SR Lead Disposition", self.twilio_settings_json)
+        self.assertIn('"Twilio Settings": "public/js/twilio_settings.js"', self.hooks)
+        self.assertIn("validate_public_callback_base_url", self.twilio_settings)
+
+    def test_callback_urls_require_public_https_base_url(self):
+        self.assertIn("def validate_public_callback_base_url", self.settings)
+        self.assertIn('parsed.scheme != "https"', self.settings)
+        self.assertIn("localhost", self.settings)
+        self.assertIn("ip.is_private", self.settings)
+        self.assertIn("Twilio Webhook Base URL must be a public HTTPS URL", self.settings)
+        self.assertIn('scheme == "http"', self.settings)
+        self.assertIn('path.startswith(("/app", "/desk", "/login", "/api"))', self.settings)
+
+    def test_callback_base_url_normalizes_full_desk_urls(self):
+        import importlib.util
+
+        module_path = SETTINGS
+        spec = importlib.util.spec_from_file_location("twilio_settings_service", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(
+            module.normalize_public_callback_base_url("http://dev-sr.butest.tech/app/twilio-agent-console"),
+            "https://dev-sr.butest.tech",
+        )
+        self.assertEqual(
+            module.normalize_public_callback_base_url("https://dev-sr.butest.tech/api/method/test"),
+            "https://dev-sr.butest.tech",
+        )
+
+    def test_call_log_disposition_does_not_mutate_schema_at_runtime(self):
+        self.assertNotIn("ensure_twilio_call_log_disposition_field", self.install)
+        self.assertNotIn("get_twilio_call_log_disposition_options", self.install)
+        self.assertNotIn("sync_call_log_disposition_options", self.disposition)
+        self.assertNotIn("sync_call_log_disposition_options", self.ai)
+        self.assertNotIn('frappe.clear_cache(doctype="Twilio Call Log")', self.install)
+
+    def test_call_log_disposition_property_setters_are_removed_by_patch(self):
+        patch_path = (
+            "twilio_click_to_call.patches.v1_0."
+            "remove_runtime_call_log_disposition_property_setters"
+        )
+        self.assertIn(patch_path, self.patches)
+        self.assertIn('DOCTYPE = "Twilio Call Log"', self.disposition_cache_patch)
+        self.assertIn(
+            'frappe.db.delete("Property Setter"',
+            self.disposition_cache_patch,
+        )
+        self.assertIn("frappe.clear_cache(doctype=DOCTYPE)", self.disposition_cache_patch)
+
+    def test_patient_followup_status_fallback_uses_custom_options(self):
+        self.assertIn('SR_FOLLOWUP_STATUS_DOCTYPE = "SR Followup Status"', self.disposition)
+        self.assertIn('PATIENT_FOLLOWUP_STATUS_FALLBACK_OPTIONS = ["Pending", "Done", "Agent Not Available"]', self.disposition)
+        self.assertIn("return PATIENT_FOLLOWUP_STATUS_FALLBACK_OPTIONS[:]", self.disposition)
+        self.assertNotIn("def get_patient_lead_disposition_fallback_options", self.disposition)
+        self.assertNotIn("return get_patient_followup_status_field_options()", self.disposition)
+
+    def test_crm_lead_status_uses_crm_lead_status_source(self):
+        self.assertIn('CRM_LEAD_STATUS = "CRM Lead Status"', self.lead_disposition)
+        self.assertIn('status_field = meta.get_field("status")', self.lead_disposition)
+        self.assertIn('linked_doctype = (status_field.options or "").strip()', self.lead_disposition)
+        self.assertIn("frappe.db.exists(\"DocType\", CRM_LEAD_STATUS)", self.lead_disposition)
+        self.assertNotIn("frappe.get_meta(SR_FOLLOWUP_STATUS)", self.lead_disposition)
+
+    def test_patient_disposition_updates_followup_status_field(self):
+        self.assertIn("PATIENT_FOLLOWUP_STATUS_FIELDS", self.disposition)
+        self.assertIn("def get_patient_followup_status_field", self.disposition)
+        self.assertIn("field = get_patient_followup_status_field(meta)", self.disposition)
+        self.assertIn("values = {field.fieldname: sr_followup_status}", self.disposition)
+        self.assertIn('"fieldname": field.fieldname', self.disposition)
+
+    def test_ai_uses_existing_sr_lead_dispositions(self):
+        self.assertIn("get_lead_disposition_rows(doc.reference_doctype, doc.reference_name)", self.ai)
+        self.assertIn("The disposition must be an existing SR Lead Disposition", self.ai)
+        self.assertNotIn("frappe.get_doc({\"doctype\": \"SR Lead Disposition\"", self.ai)
+        self.assertIn("sync_call_disposition_to_lead(doc, disposition)", self.ai)
+        self.assertIn("doc.disposition = disposition", self.ai)
+        self.assertIn("auto_disposed = bool(settings.enable_ai_disposition and not review_required)", self.ai)
+        self.assertIn("lead_auto_applied = bool(auto_disposed)", self.ai)
+
+    def test_ai_disposition_system_prompt_is_editable_in_settings(self):
+        self.assertIn("DEFAULT_AI_DISPOSITION_SYSTEM_PROMPT", self.ai)
+        self.assertIn("ai_disposition_system_prompt", self.ai)
+        self.assertIn("build_prompt(doc, dispositions, disposition_rows, settings)", self.ai)
+        self.assertIn('self.meta.has_field("ai_disposition_system_prompt")', self.twilio_settings)
+        self.assertIn('self.get("ai_disposition_system_prompt")', self.twilio_settings)
+        self.assertIn('"fieldname": "ai_disposition_system_prompt"', self.twilio_settings_json)
+        self.assertIn('"label": "System Prompt"', self.twilio_settings_json)
+        self.assertIn("Return only valid JSON in this shape", self.ai)
+
+    def test_standalone_provider_receive_transcript_can_trigger_click_to_call_ai(self):
+        self.assertIn("on_update", self.hooks)
+        self.assertIn("twilio_click_to_call.services.ai.on_twilio_call_log_update", self.hooks)
+        self.assertIn("def maybe_enqueue_from_transcript_update", self.ai)
+        self.assertIn('doc.get("transcription_text")', self.ai)
+        self.assertIn("enqueue_ai_disposition(doc.name, commit=False)", self.ai)
+
+    def test_standalone_provider_provider_log_updates_restore_click_to_call_call(self):
+        self.assertIn("def sync_provider_update_to_click_to_call_log", self.ai)
+        self.assertIn('"source_app": "twilio_click_to_call"', self.ai)
+        self.assertIn("restore_mapping_for_call_log(target)", self.ai)
+        self.assertIn("enqueue_ai_disposition(target, commit=False)", self.ai)
+        self.assertIn('"transcription_text"', self.ai)
+
+    def test_standalone_provider_provider_status_updates_are_normalized_to_terminal_states(self):
+        self.assertIn("normalize_provider_update_status(target, values)", self.ai)
+        self.assertIn("def normalize_provider_update_status", self.ai)
+        self.assertIn("normalize_status_values(current_status, values)", self.ai)
+        call_status = (APP / "services" / "call_status.py").read_text(encoding="utf-8")
+        self.assertIn("def status_from_provider", call_status)
+        self.assertIn("def status_bucket", call_status)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import frappe
+from frappe import _
+from frappe.model.document import Document
+
+from twilio_click_to_call.services.ai import DEFAULT_AI_DISPOSITION_SYSTEM_PROMPT
+from twilio_click_to_call.services.numbers import normalize_phone_number
+from twilio_click_to_call.services.settings import (
+    get_caller_ids,
+    normalize_public_callback_base_url,
+    validate_public_callback_base_url,
+)
+
+
+class TwilioSettings(Document):
+    def validate(self):
+        self.default_country_code = (self.default_country_code or "+91").strip()
+        self.caller_ids = self.normalize_caller_ids()
+        if self.default_caller_id:
+            self.default_caller_id = normalize_phone_number(
+                self.default_caller_id,
+                default_country_code=self.default_country_code,
+            )
+        if self.enable_end_fallback and self.end_fallback_mobile:
+            self.end_fallback_mobile = normalize_phone_number(
+                self.end_fallback_mobile,
+                default_country_code=self.default_country_code,
+            )
+        if self.enable_busy_callback_ai_fallback and self.busy_callback_ai_fallback_mobile:
+            self.busy_callback_ai_fallback_mobile = normalize_phone_number(
+                self.busy_callback_ai_fallback_mobile,
+                default_country_code=self.default_country_code,
+            )
+        self.allowed_doctypes = (self.allowed_doctypes or "CRM Lead\nContact\nPatient\nCustomer").strip()
+        self.default_call_flow = "Agent First"
+        if self.webhook_base_url:
+            self.webhook_base_url = normalize_public_callback_base_url(self.webhook_base_url)
+        self.manual_disposition_options = (
+            self.manual_disposition_options
+            or "Connected\nNo Answer\nBusy\nFailed\nWrong Number\nNot Interested\nInterested\n"
+            "Follow Up Required\nConverted\nCall Back Later\nLanguage Issue\nDuplicate Lead\n"
+            "Invalid Number\nDo Not Call"
+        )
+        self.agent_ring_timeout = self.agent_ring_timeout or 30
+        self.max_call_duration = self.max_call_duration or 3600
+        if self.enable_end_fallback and not self.end_fallback_mobile:
+            frappe.throw(_("End Fallback Mobile is required when End Fallback is enabled."))
+        if self.enable_busy_callback_ai_fallback and not self.busy_callback_ai_fallback_mobile:
+            frappe.throw(_("Busy Callback AI Fallback Mobile is required when Busy Callback AI Fallback is enabled."))
+        self.max_call_attempts_per_reference_per_day = self.max_call_attempts_per_reference_per_day or 0
+        self.max_calls_per_user_per_day = self.max_calls_per_user_per_day or 0
+        self.idle_auto_offline_minutes = max(1, frappe.utils.cint(self.idle_auto_offline_minutes) or 5)
+        self.http_timeout = self.http_timeout or 20
+        self.cdr_sync_lookback_days = self.cdr_sync_lookback_days or 7
+        self.recording_format = self.recording_format or "mp3"
+        self.record_channel_type = self.record_channel_type or "stereo"
+        self.recording_time_limit = self.recording_time_limit or self.max_call_duration or 3600
+        self.transcription_model = self.transcription_model or "gpt-4o-mini-transcribe"
+        self.openai_model = self.openai_model or "gpt-4.1-mini"
+        self.ai_confidence_threshold = self.ai_confidence_threshold or 0.75
+        if self.meta.has_field("ai_disposition_system_prompt"):
+            self.ai_disposition_system_prompt = (
+                self.get("ai_disposition_system_prompt") or DEFAULT_AI_DISPOSITION_SYSTEM_PROMPT
+            ).strip()
+        self.sync_ai_disposition_options()
+
+        if not self.enabled:
+            return
+
+        from twilio_click_to_call.api.provisioning import assert_crm_twilio_disabled
+
+        assert_crm_twilio_disabled()
+
+        auth_token = None
+        try:
+            auth_token = self.get_password("auth_token")
+        except Exception:
+            auth_token = None
+
+        account_sid = self.account_sid or frappe.conf.get("twilio_account_sid")
+        auth_token = auth_token or frappe.conf.get("twilio_auth_token")
+
+        if not (account_sid and auth_token):
+            frappe.throw(_("Twilio Account SID and Auth Token are required when Twilio Settings is enabled."))
+
+        if not get_caller_ids(self):
+            frappe.throw(_("At least one Caller ID is required when Twilio Settings is enabled."))
+
+        validate_public_callback_base_url(self.webhook_base_url or frappe.conf.get("twilio_webhook_base_url") or frappe.utils.get_url())
+
+    def normalize_caller_ids(self) -> str:
+        values = []
+        seen = set()
+        for value in (self.caller_ids or "").replace(",", "\n").splitlines():
+            number = normalize_phone_number(value.strip(), default_country_code=self.default_country_code)
+            if number and number not in seen:
+                values.append(number)
+                seen.add(number)
+        if self.default_caller_id:
+            number = normalize_phone_number(self.default_caller_id, default_country_code=self.default_country_code)
+            if number and number not in seen:
+                values.insert(0, number)
+        return "\n".join(values)
+
+    def sync_ai_disposition_options(self) -> list[str]:
+        options = get_sr_lead_disposition_options()
+        if options:
+            self.ai_disposition_options = "\n".join(options)
+        else:
+            self.ai_disposition_options = (
+                self.ai_disposition_options
+                or "Interested\nNot Interested\nFollow Up\nCallback Requested\nWrong Number\nNo Requirement\nConverted\nComplaint\nDo Not Call\nUnknown"
+            )
+        return options
+
+
+def get_sr_lead_disposition_options() -> list[str]:
+    try:
+        from twilio_click_to_call.services.lead_disposition import get_lead_disposition_rows
+
+        rows = get_lead_disposition_rows()
+        return [row["name"] for row in rows if row.get("name")]
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Twilio Settings SR Lead Disposition sync failed")
+        return []
+
+
+@frappe.whitelist()
+def sync_ai_disposition_options() -> dict:
+    if "System Manager" not in frappe.get_roles():
+        frappe.throw(_("Not permitted."))
+
+    settings = frappe.get_single("Twilio Settings")
+    options = settings.sync_ai_disposition_options()
+    settings.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {
+        "count": len(options),
+        "options": settings.ai_disposition_options or "",
+    }
+
+
+@frappe.whitelist()
+def get_caller_id_options() -> list[str]:
+    if "System Manager" not in frappe.get_roles():
+        frappe.throw(_("Not permitted."))
+    return get_caller_ids(frappe.get_single("Twilio Settings"))

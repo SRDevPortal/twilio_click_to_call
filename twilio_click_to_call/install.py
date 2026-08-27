@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import frappe
+from frappe import _
+from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+
+def after_install():
+    ensure_dependencies()
+    ensure_defaults()
+
+
+def after_migrate():
+    ensure_dependencies()
+    ensure_defaults()
+
+
+def ensure_dependencies():
+    try:
+        import twilio  # noqa: F401
+    except ImportError:
+        frappe.throw(_("Install the Python 'twilio' package before installing Twilio Click To Call."))
+
+
+def ensure_defaults():
+    if not frappe.db.exists("DocType", "Twilio Settings"):
+        return
+
+    ensure_twilio_roles()
+    settings = frappe.get_single("Twilio Settings")
+    changed = False
+
+    defaults = {
+        "caller_ids": "",
+        "default_country_code": "+91",
+        "allowed_doctypes": "CRM Lead\nContact\nPatient\nCustomer",
+        "default_call_flow": "Agent First",
+        "manual_disposition_options": (
+            "Connected\nNo Answer\nBusy\nFailed\nWrong Number\nNot Interested\nInterested\n"
+            "Follow Up Required\nConverted\nCall Back Later\nLanguage Issue\nDuplicate Lead\n"
+            "Invalid Number\nDo Not Call"
+        ),
+        "agent_ring_timeout": 30,
+        "http_timeout": 20,
+        "max_call_duration": 3600,
+        "enable_end_fallback": 0,
+        "end_fallback_mobile": "",
+        "enable_busy_callback_ai_fallback": 0,
+        "busy_callback_ai_fallback_mobile": "",
+        "store_raw_payloads": 1,
+        "prevent_blocked_numbers": 1,
+        "max_call_attempts_per_reference_per_day": 0,
+        "max_calls_per_user_per_day": 0,
+        "enable_cdr_sync": 1,
+        "cdr_sync_lookback_days": 7,
+        "enable_recording": 0,
+        "recording_format": "mp3",
+        "record_channel_type": "stereo",
+        "recording_time_limit": 3600,
+        "enable_transcription": 0,
+        "transcription_model": "gpt-4o-mini-transcribe",
+        "enable_ai_disposition": 0,
+        "openai_model": "gpt-4.1-mini",
+        "ai_confidence_threshold": 0.75,
+        "ai_disposition_options": (
+            "Interested\nNot Interested\nFollow Up\nCallback Requested\nWrong Number\nNo Requirement\n"
+            "Converted\nComplaint\nDo Not Call\nUnknown"
+        ),
+        "auto_apply_ai_disposition": 0,
+        "add_ai_summary_comment": 1,
+    }
+
+    for fieldname, value in defaults.items():
+        if not settings.get(fieldname):
+            settings.set(fieldname, value)
+            changed = True
+
+    if changed:
+        settings.save(ignore_permissions=True)
+
+    ensure_crm_lead_fields()
+    ensure_issue_department_fields()
+    ensure_crm_lead_disposition_optional()
+
+
+def ensure_twilio_roles() -> None:
+    if not frappe.db.exists("Role", "Twilio Agent"):
+        frappe.get_doc({
+            "doctype": "Role",
+            "role_name": "Twilio Agent",
+            "desk_access": 1,
+        }).insert(ignore_permissions=True)
+    if not frappe.db.exists("DocType", "Twilio User Mapping"):
+        return
+    for user in frappe.get_all(
+        "Twilio User Mapping", filters={"enabled": 1}, pluck="user"
+    ):
+        if user and frappe.db.exists("User", user):
+            frappe.get_doc("User", user).add_roles("Twilio Agent")
+
+
+def ensure_crm_lead_disposition_optional():
+    if not frappe.db.exists("DocType", "CRM Lead"):
+        return
+
+    fields = ("sr_lead_disposition", "lead_disposition", "disposition")
+    meta = frappe.get_meta("CRM Lead")
+    from frappe.custom.doctype.property_setter.property_setter import make_property_setter
+
+    for fieldname in fields:
+        if not meta.has_field(fieldname):
+            continue
+        make_property_setter("CRM Lead", fieldname, "reqd", "0", "Check", validate_fields_for_doctype=False)
+        make_property_setter(
+            "CRM Lead",
+            fieldname,
+            "mandatory_depends_on",
+            "",
+            "Text",
+            validate_fields_for_doctype=False,
+        )
+        custom_field = frappe.db.get_value("Custom Field", {"dt": "CRM Lead", "fieldname": fieldname}, "name")
+        if custom_field:
+            frappe.db.set_value(
+                "Custom Field",
+                custom_field,
+                {"reqd": 0, "mandatory_depends_on": ""},
+                update_modified=False,
+            )
+
+    frappe.clear_cache(doctype="CRM Lead")
+
+
+def ensure_crm_lead_fields():
+    if not frappe.db.exists("DocType", "CRM Lead"):
+        return
+
+    create_custom_fields(
+        {
+            "CRM Lead": [
+                {
+                    "fieldname": "twilio_calling_section",
+                    "label": "Twilio Calling",
+                    "fieldtype": "Section Break",
+                    "insert_after": "mobile_no",
+                    "collapsible": 1,
+                },
+                {
+                    "fieldname": "twilio_do_not_call",
+                    "label": "Do Not Call",
+                    "fieldtype": "Check",
+                    "insert_after": "twilio_calling_section",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_do_not_call_reason",
+                    "label": "Do Not Call Reason",
+                    "fieldtype": "Small Text",
+                    "insert_after": "twilio_do_not_call",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_last_call_status",
+                    "label": "Last Call Status",
+                    "fieldtype": "Data",
+                    "insert_after": "twilio_do_not_call_reason",
+                    "read_only": 1,
+                    "in_list_view": 1,
+                },
+                {
+                    "fieldname": "twilio_last_call_time",
+                    "label": "Last Call Time",
+                    "fieldtype": "Datetime",
+                    "insert_after": "twilio_last_call_status",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_last_called_by",
+                    "label": "Last Called By",
+                    "fieldtype": "Link",
+                    "options": "User",
+                    "insert_after": "twilio_last_call_time",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_last_disposition",
+                    "label": "Last Disposition",
+                    "fieldtype": "Data",
+                    "insert_after": "twilio_last_called_by",
+                    "read_only": 1,
+                    "in_list_view": 1,
+                },
+                {
+                    "fieldname": "twilio_next_follow_up",
+                    "label": "Next Follow-up",
+                    "fieldtype": "Datetime",
+                    "insert_after": "twilio_last_disposition",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_call_counts_column",
+                    "fieldtype": "Column Break",
+                    "insert_after": "twilio_next_follow_up",
+                },
+                {
+                    "fieldname": "twilio_total_call_attempts",
+                    "label": "Total Call Attempts",
+                    "fieldtype": "Int",
+                    "insert_after": "twilio_call_counts_column",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_connected_call_count",
+                    "label": "Connected Call Count",
+                    "fieldtype": "Int",
+                    "insert_after": "twilio_total_call_attempts",
+                    "read_only": 1,
+                },
+                {
+                    "fieldname": "twilio_missed_call_count",
+                    "label": "Missed Call Count",
+                    "fieldtype": "Int",
+                    "insert_after": "twilio_connected_call_count",
+                    "read_only": 1,
+                },
+            ]
+        },
+        update=True,
+    )
+
+
+def ensure_issue_department_fields():
+    if not frappe.db.exists("DocType", "Issue"):
+        return
+
+    _delete_custom_field_if_type_mismatch("Issue", "sr_department", "Link")
+
+    create_custom_fields(
+        {
+            "Issue": [
+                {
+                    "fieldname": "sr_department",
+                    "label": "Department",
+                    "fieldtype": "Link",
+                    "options": "Department",
+                    "insert_after": "customer",
+                    "in_list_view": 1,
+                    "in_standard_filter": 1,
+                },
+                {
+                    "fieldname": "sr_medical_department",
+                    "label": "Medical Department",
+                    "fieldtype": "Link",
+                    "options": "Medical Department",
+                    "insert_after": "sr_department",
+                    "depends_on": "eval:(doc.sr_department || '').toLowerCase().includes('medical department')",
+                    "mandatory_depends_on": "eval:(doc.sr_department || '').toLowerCase().includes('medical department')",
+                    "in_list_view": 1,
+                    "in_standard_filter": 1,
+                },
+            ]
+        },
+        update=True,
+    )
+    frappe.clear_cache(doctype="Issue")
+
+
+def _delete_custom_field_if_type_mismatch(dt: str, fieldname: str, expected_fieldtype: str):
+    custom_field = frappe.db.get_value(
+        "Custom Field",
+        {"dt": dt, "fieldname": fieldname},
+        ["name", "fieldtype"],
+        as_dict=True,
+    )
+    if custom_field and custom_field.fieldtype != expected_fieldtype:
+        frappe.delete_doc("Custom Field", custom_field.name, ignore_permissions=True, force=True)
+        frappe.clear_cache(doctype=dt)

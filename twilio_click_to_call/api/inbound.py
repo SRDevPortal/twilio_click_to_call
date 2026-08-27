@@ -1,0 +1,2029 @@
+from __future__ import annotations
+
+import json
+import hmac
+import secrets
+from typing import Any
+from xml.sax.saxutils import escape, quoteattr
+
+import frappe
+from frappe.rate_limiter import rate_limit
+from werkzeug.wrappers import Response
+from twilio.twiml.voice_response import VoiceResponse
+
+from twilio_click_to_call.services.call_log import make_outbound_call_key, sync_reference_links
+from twilio_click_to_call.services.call_log import find_by_phone, last10
+from twilio_click_to_call.api.call import get_mapping_unavailable_reason, get_user_mapping, restore_mapping_after_call
+from twilio_click_to_call.api.device import identity_for_user
+from twilio_click_to_call.api.console import is_agent_console_online
+from twilio_click_to_call.services.call_log_update import save_doc_latest, snapshot_doc
+from twilio_click_to_call.services.call_status import status_from_provider
+from twilio_click_to_call.services.debug_log import log_twilio_event
+from twilio_click_to_call.services.numbers import normalize_phone_number, provider_phone_number
+from twilio_click_to_call.services.patient_routing import patient_matches_mapping
+from twilio_click_to_call.services.webhooks import validate_twilio_request
+from twilio_click_to_call.services.settings import (
+    build_callback_url,
+    get_caller_ids,
+    get_default_country_code,
+    get_inbound_callback_token,
+    get_settings,
+    prefer_current_lead_assignment_for_incoming_calls,
+)
+
+TERMINAL_STATUSES = {"Completed", "Failed", "Busy", "No Answer", "Cancelled", "Canceled"}
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
+@rate_limit(limit=300, seconds=60)
+def route():
+    """Route inbound DID callbacks to the agent who last called this customer."""
+    validate_twilio_request()
+    payload = _payload()
+    event = _event_name(payload)
+    settings = get_settings()
+    if not settings.enabled:
+        return _plain_response("IGNORED")
+    default_country_code = get_default_country_code(settings)
+    did_number = normalize_phone_number(_first_value(payload, "To", "to", "Called", "did", "DID"), default_country_code=default_country_code)
+
+    if not _inbound_callback_allowed(payload, settings, did_number):
+        return _plain_response("IGNORED") if event == "hangup" else _xml_response(_hangup_xml())
+
+    if event == "hangup":
+        call_log = find_existing_inbound_call(payload)
+        if call_log:
+            update_inbound_call_event(call_log, payload)
+            if call_log.status in TERMINAL_STATUSES:
+                restore_mapping_after_call(call_log.name)
+                frappe.db.commit()
+        else:
+            log_twilio_event("Inbound hangup ignored: matching call log not found", severity="Warning", payload=payload)
+        return _plain_response("OK")
+
+    if event and event not in {"callinitiated", "startapp", "ring"}:
+        call_log = find_existing_inbound_call(payload)
+        if call_log:
+            update_inbound_call_event(call_log, payload)
+        return _plain_response("OK")
+
+    customer_number = normalize_phone_number(_first_value(payload, "From", "from", "Caller", "caller_id"), default_country_code=default_country_code)
+
+    if not customer_number:
+        log_twilio_event("Inbound route ignored: caller number missing", severity="Warning", payload=payload)
+        return _xml_response(_hangup_xml())
+
+    existing = find_existing_reference(customer_number)
+    reference_first = bool(
+        existing
+        and (
+            existing.get("doctype") == "CRM Lead"
+            or
+            existing.get("treat_as_new")
+            or prefer_current_lead_assignment_for_incoming_calls(settings)
+        )
+    )
+    if reference_first:
+        routed = route_unknown_inbound(
+            customer_number,
+            did_number,
+            payload,
+            settings,
+            existing=existing,
+            existing_checked=True,
+        )
+        if routed:
+            return routed
+
+    previous = find_last_customer_agent(customer_number)
+    if not previous:
+        routed = route_unknown_inbound(
+            customer_number,
+            did_number,
+            payload,
+            settings,
+            existing=existing,
+            existing_checked=True,
+        )
+        if routed:
+            return routed
+        log_twilio_event("Inbound route ignored: no previous mapped agent found", severity="Warning", payload=payload)
+        return _xml_response(_hangup_xml())
+
+    target = resolve_inbound_target(previous, settings)
+    agent_mobile = target.get("agent_mobile")
+    if not agent_mobile:
+        call_log = find_existing_inbound_call(payload) or create_inbound_call_log(previous, customer_number, did_number, "", payload)
+        mark_inbound_missed(
+            call_log,
+            target.get("reason") or "No mapped agent or fallback number was available.",
+            payload,
+            commit=False,
+        )
+        log_twilio_event(
+            "Inbound route ignored: previous agent mapping unavailable",
+            severity="Warning",
+            payload={"customer_number": customer_number, "previous_call_log": previous.name, "user": previous.user, "reason": target.get("reason")},
+        )
+        frappe.db.commit()
+        return _xml_response(_hangup_xml())
+
+    call_log = find_existing_inbound_call(payload) or create_inbound_call_log(
+        previous,
+        customer_number,
+        did_number,
+        agent_mobile,
+        payload,
+        target_user=target.get("user") or previous.user,
+        route_type=target.get("route_type") or "last_agent",
+        origin_user=previous.user,
+    )
+    update_inbound_call_event(call_log, payload, commit=False)
+    if target.get("is_mapped_agent"):
+        _mark_mapping_busy(target.get("user"), call_log.name)
+
+    if _is_trunk_notification(payload):
+        log_twilio_event(
+            "Inbound SIP trunk webhook is informational only; configure the DID on a Twilio XML Application Answer URL to enable agent callback routing.",
+            call_log=call_log.name,
+            severity="Warning",
+            payload={
+                "event": _first_value(payload, "Event", "event"),
+                "trunk_id": _first_value(payload, "TrunkID", "trunk_id"),
+                "sip_call_id": _first_value(payload, "SIPCallID", "sip_call_id"),
+                "customer_number": customer_number,
+                "did_number": did_number,
+                "mapped_agent": agent_mobile,
+            },
+        )
+        frappe.db.commit()
+        return _plain_response("OK")
+
+    if target.get("is_mapped_agent"):
+        publish_callback_notification(call_log, previous, customer_number, did_number, agent_mobile)
+    xml = _dial_agent_xml(call_log, agent_mobile, settings)
+    frappe.db.commit()
+    return _xml_response(xml)
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
+@rate_limit(limit=300, seconds=60)
+def dial_action(call_log: str | None = None, token: str | None = None):
+    doc, payload = _validate_callback(call_log, token)
+    if not doc:
+        return _xml_response(_hangup_xml())
+
+    doc = _lock_call_log(doc)
+    before = snapshot_doc(doc)
+    apply_provider_payload(doc, payload)
+    status = str(_first_value(payload, "DialCallStatus", "dial_call_status", "DialStatus", "dial_status", "Status", "status") or "").strip().lower().replace("_", "-")
+    failed = _dial_failed(status) or _dial_completed_without_bridge(payload, doc.status)
+    if failed:
+        next_target = _next_inbound_fallback(doc)
+        if next_target.get("agent_mobile"):
+            settings = get_settings()
+            restore_mapping_after_call(doc.name)
+            doc.user = next_target.get("user") or doc.user
+            doc.agent_number = next_target["agent_mobile"]
+            doc.user_mobile = next_target["agent_mobile"]
+            doc.status = "Agent Ringing"
+            doc.error_message = next_target.get("message") or "Mapped agent did not answer; routing to fallback agent."
+            _mark_route_attempted(doc, doc.user)
+            doc = save_doc_latest(doc, before)
+            if next_target.get("is_mapped_agent"):
+                _mark_mapping_busy(doc.user, doc.name)
+            frappe.db.commit()
+            return _xml_response(_dial_agent_xml(doc, next_target["agent_mobile"], settings))
+
+    if failed and _should_try_end_fallback(doc):
+        settings = get_settings()
+        end_mobile = _end_fallback_mobile(settings)
+        restore_mapping_after_call(doc.name)
+        _set_request_flag(doc, "end_fallback_attempted", True)
+        doc.agent_number = end_mobile
+        doc.user_mobile = end_mobile
+        doc.status = "Agent Ringing"
+        doc.error_message = "Mapped agent did not answer; routing to end fallback mobile."
+        doc = save_doc_latest(doc, before)
+        frappe.db.commit()
+        return _xml_response(_dial_agent_xml(doc, end_mobile, settings))
+
+    if status in {"answered", "answer", "in-progress", "in progress", "connected"}:
+        doc.status = "Connected"
+        doc.answer_time = doc.answer_time or frappe.utils.now()
+    elif failed:
+        if status == "busy":
+            doc.status = "Busy"
+        elif status in {"no-answer", "no answer", "timeout", "completed"}:
+            doc.status = "No Answer"
+        else:
+            doc.status = "Failed"
+        doc.end_time = doc.end_time or frappe.utils.now()
+    elif status == "completed":
+        doc.status = "Completed"
+        doc.end_time = doc.end_time or frappe.utils.now()
+    try:
+        request_data = json.loads(doc.request_json or "{}")
+    except Exception:
+        request_data = {}
+    if not isinstance(request_data, dict):
+        request_data = {}
+    request_data.update(_safe_payload(payload))
+    doc.request_json = json.dumps(request_data, indent=2, default=str)
+    doc = save_doc_latest(doc, before)
+    if doc.status in TERMINAL_STATUSES:
+        restore_mapping_after_call(doc.name)
+    frappe.db.commit()
+    if doc.status == "Connected":
+        _start_recording_safely(doc.name)
+    return _xml_response(_wait_xml())
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
+@rate_limit(limit=300, seconds=60)
+def dial_event(call_log: str | None = None, token: str | None = None):
+    """Track the agent B-leg so incoming talk time starts when the agent answers."""
+    doc, payload = _validate_callback(call_log, token)
+    if not doc:
+        return _plain_response("IGNORED")
+
+    doc = _lock_call_log(doc)
+    before = snapshot_doc(doc)
+    apply_provider_payload(doc, payload)
+    event = _event_name(payload)
+    dial_action_name = str(_first_value(payload, "DialAction", "dial_action") or "").strip().lower()
+    event_time = _first_value(
+        payload,
+        "AnswerTime",
+        "DialAnswerTime",
+        "EndTime",
+        "Timestamp",
+        "timestamp",
+    ) or frappe.utils.now()
+
+    if event in {"dialanswer", "dialconnected", "in-progress"} or dial_action_name in {"answer", "connected"}:
+        doc.answer_time = doc.answer_time or event_time
+        doc.status = "Connected"
+        doc.call_status = "connected"
+    elif event in {"dialhangup", "completed", "busy", "failed", "no-answer", "canceled", "cancelled"} or dial_action_name == "hangup":
+        doc.end_time = _first_value(payload, "EndTime", "Timestamp", "timestamp") or frappe.utils.now()
+        answered_seconds = _answered_seconds(doc)
+        if answered_seconds > 0:
+            doc.duration = answered_seconds
+            doc.billsec = answered_seconds
+            doc.status = "Completed"
+            doc.call_status = "completed"
+        else:
+            provider_status = str(
+                _first_value(
+                    payload,
+                    "DialBLegStatus",
+                    "DialStatus",
+                    "CallStatus",
+                    "Status",
+                )
+                or ""
+            ).strip()
+            doc.status = status_from_provider(
+                {
+                    "status": provider_status,
+                    "call_status": provider_status,
+                    "hangup_cause": _first_value(
+                        payload,
+                        "DialBLegHangupCause",
+                        "DialHangupCause",
+                        "HangupCause",
+                    ),
+                },
+                previous=doc.status,
+            ) or "No Answer"
+        doc.hangup_cause = _first_value(
+            payload,
+            "DialBLegHangupCause",
+            "DialHangupCause",
+            "HangupCause",
+        ) or doc.hangup_cause
+
+    try:
+        request_data = json.loads(doc.request_json or "{}")
+    except Exception:
+        request_data = {}
+    if not isinstance(request_data, dict):
+        request_data = {}
+    request_data.update(_safe_payload(payload))
+    doc.request_json = json.dumps(request_data, indent=2, default=str)
+    doc = save_doc_latest(doc, before)
+    if doc.status in TERMINAL_STATUSES:
+        restore_mapping_after_call(doc.name)
+    frappe.db.commit()
+    return _plain_response("OK")
+
+
+def find_last_customer_agent(customer_number: str):
+    normalized = normalize_phone_number(customer_number, default_country_code=get_default_country_code())
+    base_filters = {
+        "source_app": "twilio_click_to_call",
+        "direction": "Outgoing",
+        "user": ["is", "set"],
+        "user_mobile": ["is", "set"],
+    }
+
+    for fieldname, value in (("normalized_customer_number", normalized), ("customer_number", normalized)):
+        if not value:
+            continue
+        rows = _last_customer_agent_rows({**base_filters, fieldname: value})
+        if rows:
+            return rows[0]
+
+    return None
+
+
+def _last_customer_agent_rows(filters: dict[str, Any]):
+    return frappe.get_all(
+        "Twilio Call Log",
+        filters=filters,
+        fields=[
+            "name",
+            "user",
+            "user_mobile",
+            "caller_id",
+            "reference_doctype",
+            "reference_name",
+            "phone_field",
+            "crm_lead",
+            "patient",
+        ],
+        order_by="creation desc",
+        limit=1,
+    )
+
+def create_inbound_call_log(
+    previous,
+    customer_number: str,
+    did_number: str,
+    agent_mobile: str,
+    payload: dict[str, Any],
+    target_user: str | None = None,
+    route_type: str = "last_agent",
+    origin_user: str | None = None,
+):
+    doc = frappe.get_doc(
+        {
+            "doctype": "Twilio Call Log",
+            "call_key": make_outbound_call_key(),
+            "source_app": "twilio_click_to_call",
+            "reference_doctype": previous.reference_doctype,
+            "reference_name": previous.reference_name,
+            "phone_field": previous.phone_field,
+            "user": target_user or previous.user,
+            "user_mobile": agent_mobile,
+            "agent_number": agent_mobile,
+            "customer_number": customer_number,
+            "normalized_customer_number": normalize_phone_number(customer_number, default_country_code=get_default_country_code()),
+            "caller_id": did_number or previous.caller_id,
+            "did_number": did_number or previous.caller_id,
+            "normalized_did": normalize_phone_number(did_number or previous.caller_id, default_country_code=get_default_country_code()),
+            "call_flow": "Customer First",
+            "direction": "Incoming",
+            "status": "Agent Ringing",
+            "from_number": customer_number,
+            "to_number": did_number,
+            "start_time": frappe.utils.now(),
+            "callback_token": secrets.token_urlsafe(24),
+            "recording_status": "Not Started",
+            "transcript_status": "Not Requested",
+            "ai_status": "Pending",
+            "ai_disposition_status": "Not Requested",
+            "cdr_sync_status": "Not Synced",
+            "currency": "INR",
+            "request_json": json.dumps(_safe_payload(payload), indent=2, default=str),
+            "error_message": f"Inbound route: {route_type}",
+        }
+    )
+    _set_request_data(doc, "fallback_origin_user", origin_user or previous.user)
+    _set_request_data(doc, "fallback_attempted_users", [target_user or previous.user])
+    if route_type == "ai_agent_end_fallback":
+        _set_request_flag(doc, "ai_agent_end_fallback_attempted", True)
+    apply_provider_payload(doc, payload)
+    doc.crm_lead = previous.crm_lead
+    doc.patient = previous.patient
+    sync_reference_links(doc)
+    doc.insert(ignore_permissions=True)
+    return doc
+
+
+def route_unknown_inbound(
+    customer_number: str,
+    did_number: str,
+    payload: dict[str, Any],
+    settings,
+    *,
+    existing: dict[str, Any] | None = None,
+    existing_checked: bool = False,
+):
+    if not existing_checked:
+        existing = find_existing_reference(customer_number)
+    if existing:
+        if existing.get("treat_as_new"):
+            log_twilio_event(
+                "Existing CRM Lead status configured to create a new inbound Lead",
+                payload={
+                    "customer_number": customer_number,
+                    "did_number": did_number,
+                    "reference_name": existing.get("name"),
+                    "status": existing.get("status"),
+                },
+            )
+        elif existing.get("doctype") == "Patient":
+            return route_existing_patient_inbound(existing["name"], customer_number, did_number, payload, settings)
+        elif existing.get("doctype") == "CRM Lead":
+            return route_existing_crm_lead_inbound(existing["name"], customer_number, did_number, payload, settings)
+        else:
+            log_twilio_event(
+                "Unknown inbound mapping skipped: caller already exists",
+                severity="Warning",
+                payload={
+                    "customer_number": customer_number,
+                    "did_number": did_number,
+                    "reference_doctype": existing.get("doctype"),
+                    "reference_name": existing.get("name"),
+                },
+            )
+            return None
+
+    if not _unknown_inbound_supported():
+        return None
+
+    mapping = find_incoming_mapping(did_number)
+    if not mapping:
+        if existing and existing.get("treat_as_new"):
+            log_twilio_event(
+                "New inbound Lead not created: DID has no enabled incoming mapping",
+                severity="Warning",
+                payload={
+                    "customer_number": customer_number,
+                    "did_number": did_number,
+                    "previous_lead": existing.get("name"),
+                    "previous_status": existing.get("status"),
+                },
+            )
+            return _xml_response(_hangup_xml())
+        return None
+
+    target = select_incoming_agent(mapping)
+    call_log = find_existing_inbound_call(payload)
+    if call_log:
+        lead = frappe.get_doc("CRM Lead", call_log.crm_lead) if call_log.crm_lead else create_unknown_inbound_lead(customer_number, did_number, mapping, target)
+        call_log.reference_doctype = "CRM Lead"
+        call_log.reference_name = lead.name
+        call_log.crm_lead = lead.name
+        call_log.user = target.get("user") or call_log.user
+        call_log.user_mobile = target.get("agent_mobile") or call_log.user_mobile
+        call_log.agent_number = target.get("agent_mobile") or call_log.agent_number
+    else:
+        lead = create_unknown_inbound_lead(customer_number, did_number, mapping, target)
+        call_log = create_unknown_inbound_call_log(
+            lead,
+            customer_number,
+            did_number,
+            payload,
+            mapping=mapping,
+            target=target,
+        )
+    update_inbound_call_event(call_log, payload, commit=False)
+
+    agent_mobile = target.get("agent_mobile")
+    if not agent_mobile:
+        mark_inbound_missed(
+            call_log,
+            target.get("reason") or "No incoming mapped agent was available.",
+            payload,
+            commit=False,
+        )
+        frappe.db.commit()
+        return _xml_response(_hangup_xml())
+
+    update_incoming_assignment(mapping, target)
+    if target.get("is_mapped_agent"):
+        _mark_mapping_busy(target.get("user"), call_log.name)
+
+    if _is_trunk_notification(payload):
+        log_twilio_event(
+            "Unknown inbound SIP trunk webhook is informational only; configure the DID on a Twilio XML Application Answer URL to enable routing.",
+            call_log=call_log.name,
+            severity="Warning",
+            payload={
+                "event": _first_value(payload, "Event", "event"),
+                "trunk_id": _first_value(payload, "TrunkID", "trunk_id"),
+                "sip_call_id": _first_value(payload, "SIPCallID", "sip_call_id"),
+                "customer_number": customer_number,
+                "did_number": did_number,
+                "mapped_agent": agent_mobile,
+            },
+        )
+        frappe.db.commit()
+        return _plain_response("OK")
+
+    if target.get("is_mapped_agent"):
+        publish_callback_notification(call_log, None, customer_number, did_number, agent_mobile)
+    xml = _dial_agent_xml(call_log, agent_mobile, settings)
+    frappe.db.commit()
+    return _xml_response(xml)
+
+
+def route_existing_patient_inbound(patient_name: str, customer_number: str, did_number: str, payload: dict[str, Any], settings):
+    patient = frappe.get_doc("Patient", patient_name)
+    target = resolve_patient_then_lead_inbound_target(patient, customer_number, settings)
+    call_log = find_existing_inbound_call(payload)
+    if call_log:
+        call_log.reference_doctype = "Patient"
+        call_log.reference_name = patient.name
+        call_log.patient = patient.name
+        call_log.crm_lead = target.get("crm_lead") or call_log.crm_lead
+        call_log.user = target.get("user") or call_log.user
+        call_log.user_mobile = target.get("agent_mobile") or call_log.user_mobile
+        call_log.agent_number = target.get("agent_mobile") or call_log.agent_number
+        origin_user = target.get("origin_user") or call_log.user
+        _set_request_data(call_log, "fallback_origin_user", origin_user)
+        _set_request_data(call_log, "fallback_attempted_users", [call_log.user] if target.get("is_mapped_agent") and call_log.user else [])
+        if target.get("skip_busy_callback_ai_fallback"):
+            _set_request_flag(call_log, "skip_busy_callback_ai_fallback", True)
+        if target.get("ai_agent_end_fallback"):
+            _set_request_flag(call_log, "ai_agent_end_fallback_attempted", True)
+        _set_ordered_fallback_route(call_log, target)
+    else:
+        call_log = create_existing_patient_inbound_call_log(
+            patient,
+            customer_number,
+            did_number,
+            payload,
+            target=target,
+        )
+    update_inbound_call_event(call_log, payload, commit=False)
+
+    agent_mobile = target.get("agent_mobile")
+    if not agent_mobile:
+        mark_inbound_missed(
+            call_log,
+            target.get("reason") or "Patient mapped agent and fallback agents were unavailable.",
+            payload,
+            commit=False,
+        )
+        frappe.db.commit()
+        return _xml_response(_hangup_xml())
+
+    if target.get("is_mapped_agent"):
+        _mark_mapping_busy(target.get("user"), call_log.name)
+
+    if _is_trunk_notification(payload):
+        log_twilio_event(
+            "Existing Patient inbound SIP trunk webhook is informational only; configure the DID on a Twilio XML Application Answer URL to enable routing.",
+            call_log=call_log.name,
+            severity="Warning",
+            payload={
+                "event": _first_value(payload, "Event", "event"),
+                "trunk_id": _first_value(payload, "TrunkID", "trunk_id"),
+                "sip_call_id": _first_value(payload, "SIPCallID", "sip_call_id"),
+                "customer_number": customer_number,
+                "did_number": did_number,
+                "mapped_agent": agent_mobile,
+            },
+        )
+        frappe.db.commit()
+        return _plain_response("OK")
+
+    if target.get("is_mapped_agent"):
+        publish_callback_notification(call_log, None, customer_number, did_number, agent_mobile)
+    xml = _dial_agent_xml(call_log, agent_mobile, settings)
+    frappe.db.commit()
+    return _xml_response(xml)
+
+
+def route_existing_crm_lead_inbound(lead_name: str, customer_number: str, did_number: str, payload: dict[str, Any], settings):
+    lead = frappe.get_doc("CRM Lead", lead_name)
+    target = resolve_lead_owner_inbound_target(lead, settings)
+    call_log = find_existing_inbound_call(payload)
+    if call_log:
+        call_log.reference_doctype = "CRM Lead"
+        call_log.reference_name = lead.name
+        call_log.crm_lead = lead.name
+        call_log.user = target.get("user") or call_log.user
+        call_log.user_mobile = target.get("agent_mobile") or call_log.user_mobile
+        call_log.agent_number = target.get("agent_mobile") or call_log.agent_number
+        origin_user = target.get("origin_user") or call_log.user
+        _set_request_data(call_log, "fallback_origin_user", origin_user)
+        _set_request_data(call_log, "fallback_attempted_users", [call_log.user] if target.get("is_mapped_agent") and call_log.user else [])
+        if target.get("skip_busy_callback_ai_fallback"):
+            _set_request_flag(call_log, "skip_busy_callback_ai_fallback", True)
+        if target.get("ai_agent_end_fallback"):
+            _set_request_flag(call_log, "ai_agent_end_fallback_attempted", True)
+    else:
+        call_log = create_existing_crm_lead_inbound_call_log(
+            lead,
+            customer_number,
+            did_number,
+            payload,
+            target=target,
+        )
+    update_inbound_call_event(call_log, payload, commit=False)
+
+    agent_mobile = target.get("agent_mobile")
+    if not agent_mobile:
+        mark_inbound_missed(
+            call_log,
+            target.get("reason") or "No incoming mapped agent was available.",
+            payload,
+            commit=False,
+        )
+        frappe.db.commit()
+        return _xml_response(_hangup_xml())
+
+    if target.get("is_mapped_agent"):
+        _mark_mapping_busy(target.get("user"), call_log.name)
+
+    if _is_trunk_notification(payload):
+        log_twilio_event(
+            "Existing CRM Lead inbound SIP trunk webhook is informational only; configure the DID on a Twilio XML Application Answer URL to enable routing.",
+            call_log=call_log.name,
+            severity="Warning",
+            payload={
+                "event": _first_value(payload, "Event", "event"),
+                "trunk_id": _first_value(payload, "TrunkID", "trunk_id"),
+                "sip_call_id": _first_value(payload, "SIPCallID", "sip_call_id"),
+                "customer_number": customer_number,
+                "did_number": did_number,
+                "mapped_agent": agent_mobile,
+            },
+        )
+        frappe.db.commit()
+        return _plain_response("OK")
+
+    if target.get("is_mapped_agent"):
+        publish_callback_notification(call_log, None, customer_number, did_number, agent_mobile)
+    xml = _dial_agent_xml(call_log, agent_mobile, settings)
+    frappe.db.commit()
+    return _xml_response(xml)
+
+
+def _unknown_inbound_supported() -> bool:
+    return bool(
+        frappe.db.exists("DocType", "Twilio Incoming Mapping")
+        and frappe.db.exists("DocType", "Twilio Incoming Mapping Agent")
+        and frappe.db.exists("DocType", "CRM Lead")
+    )
+
+
+def find_existing_reference(customer_number: str) -> dict[str, str] | None:
+    if frappe.db.exists("DocType", "Patient"):
+        patient = find_by_phone("Patient", ("mobile", "mobile_no", "phone", "custom_whatsapp_number"), customer_number)
+        if patient:
+            return {"doctype": "Patient", "name": patient}
+
+    if frappe.db.exists("DocType", "CRM Lead"):
+        lead = find_latest_crm_lead_by_phone(customer_number)
+        if lead:
+            return {
+                "doctype": "CRM Lead",
+                "name": lead.name,
+                "status": lead.status,
+                "treat_as_new": lead.status in _incoming_call_treat_as_new_statuses(),
+            }
+    return None
+
+
+def find_latest_crm_lead_by_phone(customer_number: str):
+    key = last10(customer_number)
+    if not key:
+        return None
+
+    meta = frappe.get_meta("CRM Lead")
+    indexed_fields = [
+        fieldname
+        for fieldname in ("sr_mobile_norm", "twilio_mobile_last10", "twilio_phone_last10", "twilio_whatsapp_last10")
+        if meta.has_field(fieldname)
+    ]
+    canonical_filters = {}
+    for fieldname in ("sr_is_archived", "sr_is_duplicate"):
+        if meta.has_field(fieldname):
+            canonical_filters[fieldname] = 0
+    newest = None
+    for fieldname in indexed_fields:
+        rows = frappe.get_all(
+            "CRM Lead",
+            filters={fieldname: key, **canonical_filters},
+            fields=["name", "status", "creation"],
+            order_by="creation desc",
+            limit=1,
+        )
+        if rows and (newest is None or rows[0].creation > newest.creation):
+            newest = rows[0]
+    return newest
+
+
+def _incoming_call_treat_as_new_statuses() -> set[str]:
+    try:
+        from crm_lead_dedupe.leads.dup_utils import incoming_call_treat_as_new_statuses
+
+        return incoming_call_treat_as_new_statuses()
+    except Exception:
+        return set()
+
+
+def find_incoming_mapping(did_number: str):
+    if not did_number:
+        return None
+
+    normalized = normalize_phone_number(did_number, default_country_code=get_default_country_code())
+    name = frappe.db.get_value("Twilio Incoming Mapping", {"enabled": 1, "normalized_did": normalized}, "name")
+    if not name:
+        name = frappe.db.get_value("Twilio Incoming Mapping", {"enabled": 1, "did_number": did_number}, "name")
+    return frappe.get_doc("Twilio Incoming Mapping", name) if name else None
+
+
+def select_incoming_agent(mapping) -> dict[str, Any]:
+    candidates = [row for row in (mapping.get("agents") or []) if frappe.utils.cint(row.get("enabled"))]
+    if not candidates:
+        return {"reason": "Incoming DID mapping has no enabled agents."}
+
+    ordered = sorted(candidates, key=lambda row: (frappe.utils.cint(row.get("priority")), frappe.utils.cint(row.get("idx"))))
+    strategy = (mapping.get("routing_strategy") or "Round Robin").strip()
+    if strategy == "Load Balancing":
+        ordered = sorted(
+            ordered,
+            key=lambda row: (
+                0 if not row.get("last_assigned_at") else 1,
+                str(row.get("last_assigned_at") or ""),
+                frappe.utils.cint(row.get("priority")),
+                frappe.utils.cint(row.get("idx")),
+            ),
+        )
+    else:
+        ordered = _round_robin_order(ordered, mapping.get("last_assigned_agent"))
+
+    unavailable = []
+    for row in ordered:
+        target = _incoming_agent_target(row)
+        if target.get("agent_mobile"):
+            return target
+        unavailable.append(target.get("reason"))
+
+    seen_fallback_users = set()
+    for row in ordered:
+        primary_user = str(row.get("agent_user") or "").strip()
+        primary_mapping = get_user_mapping(primary_user) if primary_user else None
+        for fallback_user in _fallback_users(primary_mapping):
+            if fallback_user in seen_fallback_users:
+                continue
+            seen_fallback_users.add(fallback_user)
+            fallback_mapping = get_user_mapping(fallback_user)
+            fallback_mobile = _mapping_mobile(fallback_mapping, "")
+            if fallback_mapping and fallback_mobile and _mapping_can_receive(fallback_user, fallback_mapping):
+                return {
+                    "user": fallback_user,
+                    "agent_mobile": fallback_mobile,
+                    "mapping_name": fallback_mapping.get("name"),
+                    "agent_row": row.name,
+                    "route_type": "incoming_did_mapping_fallback_user",
+                    "is_mapped_agent": True,
+                    "origin_user": primary_user,
+                    "incoming_primary_user": primary_user,
+                }
+            unavailable.append(f"Incoming fallback user {fallback_user} is unavailable.")
+
+    for row in ordered:
+        primary_user = str(row.get("agent_user") or "").strip()
+        primary_mapping = get_user_mapping(primary_user) if primary_user else None
+        ai_target = _ai_agent_end_fallback_target(
+            primary_mapping,
+            route_type="incoming_did_mapping_ai_agent_end_fallback",
+            origin_user=primary_user,
+            message="Incoming mapped agents and normal fallback users were unavailable; routing to AI agent end fallback.",
+        )
+        if ai_target:
+            ai_target["agent_row"] = row.name
+            ai_target["incoming_primary_user"] = primary_user
+            return ai_target
+    return {"reason": "No incoming mapped agent was online and available.", "unavailable": unavailable}
+
+
+def _round_robin_order(rows: list, last_agent: str | None) -> list:
+    if not rows or not last_agent:
+        return rows
+    for index, row in enumerate(rows):
+        if row.get("agent_user") == last_agent:
+            return rows[index + 1 :] + rows[: index + 1]
+    return rows
+
+
+def _incoming_agent_target(row) -> dict[str, Any]:
+    user = (row.get("agent_user") or "").strip()
+    if not user:
+        return {"reason": "Incoming mapped agent row is missing a user."}
+
+    agent_mobile = normalize_phone_number(row.get("agent_mobile") or "", default_country_code=get_default_country_code())
+    if not agent_mobile:
+        return {"user": user, "reason": f"Incoming mapped agent {user} is missing a bridge mobile number."}
+
+    if not is_agent_console_online(user):
+        return {"user": user, "reason": f"Incoming mapped agent {user} is offline."}
+
+    mapping = get_user_mapping(user)
+    if not mapping:
+        return {"user": user, "reason": f"Incoming mapped agent {user} has no enabled Twilio User Mapping."}
+
+    unavailable_reason = get_mapping_unavailable_reason(mapping)
+    if unavailable_reason:
+        return {"user": user, "reason": str(unavailable_reason)}
+
+    return {
+        "user": user,
+        "agent_mobile": agent_mobile,
+        "mapping_name": mapping.get("name"),
+        "agent_row": row.name,
+        "route_type": "incoming_did_mapping",
+        "is_mapped_agent": True,
+        "incoming_primary_user": user,
+    }
+
+
+def resolve_patient_then_lead_inbound_target(patient, customer_number: str, settings=None) -> dict[str, Any]:
+    """Route a known Patient to its matched agent, then the current CRM Lead chain.
+
+    Incoming DID mappings are intentionally excluded: they are reserved for
+    callers who do not already exist as a Patient or CRM Lead.
+    """
+    settings = settings or get_settings()
+    primary = resolve_patient_primary_inbound_target(patient)
+    lead_row = find_latest_crm_lead_by_phone(customer_number)
+    if not lead_row:
+        return resolve_patient_inbound_target(patient, settings)
+
+    lead = frappe.get_doc("CRM Lead", lead_row.name)
+    owner = str(lead.get("lead_owner") or "").strip()
+    owner_mapping = get_user_mapping(owner) if owner else None
+    ordered_users = [owner, *_fallback_users(owner_mapping)] if owner else []
+    ordered_users = [user for index, user in enumerate(ordered_users) if user and user not in ordered_users[:index]]
+    ai_user = str((owner_mapping or {}).get("ai_agent_end_fallback") or "").strip()
+
+    if primary.get("agent_mobile"):
+        primary.update(
+            {
+                "crm_lead": lead.name,
+                "lead_owner": owner,
+                "ordered_fallback_users": ordered_users,
+                "ordered_ai_user": ai_user,
+                "strict_ordered_fallback": True,
+                "skip_busy_callback_ai_fallback": True,
+            }
+        )
+        return primary
+
+    unavailable = list(primary.get("unavailable") or [])
+    if primary.get("reason"):
+        unavailable.append(primary["reason"])
+    for index, user in enumerate(ordered_users):
+        mapping = get_user_mapping(user)
+        mobile = _mapping_mobile(mapping, "")
+        if mapping and mobile and _mapping_can_receive(user, mapping):
+            return {
+                "user": user,
+                "agent_mobile": mobile,
+                "route_type": "patient_to_lead_owner" if user == owner else "patient_to_lead_owner_fallback_user",
+                "is_mapped_agent": True,
+                "origin_user": owner,
+                "crm_lead": lead.name,
+                "lead_owner": owner,
+                "ordered_fallback_users": ordered_users[index + 1 :],
+                "ordered_ai_user": ai_user,
+                "strict_ordered_fallback": True,
+                "skip_busy_callback_ai_fallback": True,
+            }
+        unavailable.append(f"CRM Lead route user {user} is unavailable.")
+
+    ai_target = _ai_agent_end_fallback_target(
+        owner_mapping,
+        route_type="patient_to_lead_owner_ai_agent_end_fallback",
+        origin_user=owner,
+        message="Patient agent, CRM Lead owner, and human fallback users were unavailable; routing to AI agent end fallback.",
+    )
+    if ai_target:
+        ai_target.update(
+            {
+                "crm_lead": lead.name,
+                "lead_owner": owner,
+                "ordered_fallback_users": [],
+                "ordered_ai_user": ai_user,
+                "strict_ordered_fallback": True,
+                "skip_busy_callback_ai_fallback": True,
+            }
+        )
+        return ai_target
+
+    return {
+        "user": owner,
+        "reason": "Patient agent, CRM Lead owner, and human fallback users were unavailable; no AI agent end fallback is configured.",
+        "unavailable": unavailable,
+        "crm_lead": lead.name,
+        "lead_owner": owner,
+        "ordered_fallback_users": [],
+        "ordered_ai_user": "",
+        "strict_ordered_fallback": True,
+        "skip_busy_callback_ai_fallback": True,
+    }
+
+
+def resolve_patient_primary_inbound_target(patient) -> dict[str, Any]:
+    mappings = patient_route_mappings(patient)
+    if not mappings:
+        return {"reason": "No Twilio User Mapping matches this Patient's department and follow-up ID."}
+
+    unavailable = []
+    for mapping in mappings:
+        user = str(mapping.get("user") or "").strip()
+        active_mapping = get_user_mapping(user) if user else None
+        mobile = _mapping_mobile(active_mapping, "")
+        if active_mapping and mobile and _mapping_can_receive(user, active_mapping):
+            return {
+                "user": user,
+                "agent_mobile": mobile,
+                "route_type": "patient_mapping",
+                "is_mapped_agent": True,
+                "origin_user": user,
+            }
+        unavailable.append(f"Patient mapped agent {user} is unavailable.")
+    return {"reason": "No patient mapped agent was available.", "unavailable": unavailable}
+
+
+def resolve_patient_inbound_target(patient, settings=None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    mappings = patient_route_mappings(patient)
+    if not mappings:
+        return {
+            "reason": "No Twilio User Mapping matches this Patient's department and follow-up ID.",
+            "skip_busy_callback_ai_fallback": True,
+        }
+
+    unavailable = []
+    for mapping in mappings:
+        user = mapping.get("user")
+        active_mapping = get_user_mapping(user) if user else None
+        mobile = _mapping_mobile(active_mapping, "")
+        if active_mapping and mobile and _mapping_can_receive(user, active_mapping) and not get_mapping_unavailable_reason(active_mapping):
+            return {
+                "user": user,
+                "agent_mobile": mobile,
+                "route_type": "patient_mapping",
+                "is_mapped_agent": True,
+                "origin_user": user,
+                "skip_busy_callback_ai_fallback": True,
+            }
+        unavailable.append(f"Patient mapped agent {user} is unavailable.")
+
+    for mapping in mappings:
+        origin_user = mapping.get("user")
+        for fallback_user in _fallback_users(mapping):
+            fallback_mapping = get_user_mapping(fallback_user)
+            fallback_mobile = _mapping_mobile(fallback_mapping, "")
+            if fallback_mapping and fallback_mobile and _mapping_can_receive(fallback_user, fallback_mapping):
+                return {
+                    "user": fallback_user,
+                    "agent_mobile": fallback_mobile,
+                    "route_type": "patient_mapping_fallback_user",
+                    "is_mapped_agent": True,
+                    "origin_user": origin_user,
+                    "skip_busy_callback_ai_fallback": True,
+                }
+            unavailable.append(f"Patient fallback user {fallback_user} is unavailable.")
+
+    for mapping in mappings:
+        ai_target = _ai_agent_end_fallback_target(
+            mapping,
+            route_type="patient_ai_agent_end_fallback",
+            origin_user=mapping.get("user"),
+            message="Patient mapped agents and fallback users were unavailable; routing to AI agent end fallback.",
+        )
+        if ai_target:
+            ai_target["skip_busy_callback_ai_fallback"] = True
+            return ai_target
+
+    return {
+        "user": mappings[0].get("user") or "",
+        "reason": "Patient mapped agents and fallback users were unavailable, and no AI agent end fallback is configured.",
+        "unavailable": unavailable,
+        "skip_busy_callback_ai_fallback": True,
+    }
+
+
+def patient_route_mappings(patient) -> list[dict[str, Any]]:
+    if not frappe.db.exists("DocType", "Twilio User Mapping"):
+        return []
+    meta = frappe.get_meta("Twilio User Mapping")
+    fields = _existing_mapping_fields(
+        meta,
+        [
+            "name",
+            "user",
+            "agent_mobile",
+            "availability_status",
+            "accept_calls",
+            "current_call_log",
+            "queue_source",
+            "fallback_user",
+            "fallback_users",
+            "ai_agent_end_fallback",
+            "sr_medical_department",
+            "sr_medical_departments",
+            "sr_followup_id",
+            "sr_followup_ids",
+            "sr_dpt_disease",
+            "sr_dpt_diseases",
+            "sr_dpt_language",
+            "sr_dpt_languages",
+        ],
+    )
+    rows = frappe.get_all(
+        "Twilio User Mapping",
+        filters={"enabled": 1, "queue_source": ["in", ["Patient", "CRM Lead and Patient"]]},
+        fields=fields,
+        order_by="modified asc",
+        limit_page_length=2000,
+    )
+    return [row for row in rows if _patient_mapping_matches(row, patient)]
+
+
+def _patient_mapping_matches(mapping: dict[str, Any], patient) -> bool:
+    return patient_matches_mapping(patient, mapping)
+
+
+def resolve_lead_owner_inbound_target(lead, settings=None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    owner = (lead.get("lead_owner") or "").strip()
+    if not owner:
+        return {"reason": "CRM Lead has no lead owner."}
+
+    mapping = get_user_mapping(owner)
+    primary_mobile = _mapping_mobile(mapping, "")
+    if mapping and primary_mobile and _mapping_can_receive(owner, mapping):
+        return {
+            "user": owner,
+            "agent_mobile": primary_mobile,
+            "route_type": "lead_owner",
+            "is_mapped_agent": True,
+            "skip_busy_callback_ai_fallback": True,
+        }
+
+    unavailable = []
+    if not mapping:
+        unavailable.append(f"Lead owner {owner} has no enabled Twilio User Mapping.")
+    elif not primary_mobile:
+        unavailable.append(f"Lead owner {owner} is missing a bridge mobile number.")
+    else:
+        unavailable.append(f"Lead owner {owner} is offline or already on a call.")
+
+    for fallback_user in _fallback_users(mapping):
+        fallback_mapping = get_user_mapping(fallback_user)
+        fallback_mobile = _mapping_mobile(fallback_mapping, "")
+        if fallback_mapping and fallback_mobile and _mapping_can_receive(fallback_user, fallback_mapping):
+            return {
+                "user": fallback_user,
+                "agent_mobile": fallback_mobile,
+                "route_type": "lead_owner_fallback_user",
+                "is_mapped_agent": True,
+                "origin_user": owner,
+                "skip_busy_callback_ai_fallback": True,
+            }
+        unavailable.append(f"Fallback user {fallback_user} is unavailable.")
+
+    ai_target = _ai_agent_end_fallback_target(
+        mapping,
+        route_type="lead_owner_ai_agent_end_fallback",
+        origin_user=owner,
+        message="CRM Lead owner and fallback users were unavailable; routing to AI agent end fallback.",
+    )
+    if ai_target:
+        ai_target["skip_busy_callback_ai_fallback"] = True
+        return ai_target
+
+    return {
+        "user": owner,
+        "reason": "CRM Lead owner and fallback users were unavailable, and no AI agent end fallback is configured.",
+        "unavailable": unavailable,
+        "skip_busy_callback_ai_fallback": True,
+    }
+
+
+def create_unknown_inbound_lead(customer_number: str, did_number: str, mapping, target: dict[str, Any]):
+    lead = frappe.new_doc("CRM Lead")
+    fields = {df.fieldname for df in lead.meta.fields}
+    defaults = unknown_inbound_lead_defaults(mapping)
+    title = f"Twilio Incoming {customer_number}"
+    if "first_name" in fields:
+        lead.first_name = title[:140]
+    if "lead_name" in fields:
+        lead.lead_name = title[:140]
+    if "mobile_no" in fields:
+        lead.mobile_no = customer_number
+    if "phone" in fields:
+        lead.phone = customer_number
+    if "status" in fields:
+        lead.status = defaults.get("status")
+    if "sr_lead_pipeline" in fields and defaults.get("pipeline"):
+        lead.sr_lead_pipeline = defaults["pipeline"]
+    if "sr_lead_platform" in fields and defaults.get("platform"):
+        lead.sr_lead_platform = defaults["platform"]
+    for source_field in ("sr_lead_source", "lead_source", "source"):
+        if source_field in fields and defaults.get("source"):
+            lead.set(source_field, defaults["source"])
+            break
+    previous_bypass = getattr(frappe.flags, "sr_bypass_field_guard", False)
+    frappe.flags.sr_bypass_field_guard = True
+    try:
+        lead.insert(ignore_permissions=True)
+    finally:
+        frappe.flags.sr_bypass_field_guard = previous_bypass
+    assign_unknown_inbound_lead(lead.name, target.get("user"))
+    lead.reload()
+    return lead
+
+
+def unknown_inbound_lead_defaults(mapping) -> dict[str, str]:
+    ai_settings = get_settings()
+
+    return {
+        "status": mapping.get("default_lead_status") or "Select Option",
+        "pipeline": mapping.get("default_pipeline") or getattr(ai_settings, "default_pipeline", None) or _first_doc("SR Lead Pipeline"),
+        "platform": mapping.get("default_platform") or getattr(ai_settings, "default_platform", None) or _first_doc("SR Lead Platform"),
+        "source": mapping.get("default_source") or "",
+    }
+
+
+def _first_doc(doctype: str, filters: dict | None = None) -> str:
+    if not frappe.db.exists("DocType", doctype):
+        return ""
+    rows = frappe.get_all(doctype, filters=filters or {}, pluck="name", limit=1)
+    return rows[0] if rows else ""
+
+
+def assign_unknown_inbound_lead(lead_name: str, user: str | None) -> None:
+    if not lead_name or not user or not frappe.db.exists("CRM Lead", lead_name):
+        return
+
+    meta = frappe.get_meta("CRM Lead")
+    values = {}
+    if meta.has_field("lead_owner"):
+        values["lead_owner"] = user
+
+    team = _single_active_team_for_user(user)
+    if team and meta.has_field("team"):
+        values["team"] = team
+
+    if values:
+        frappe.db.set_value("CRM Lead", lead_name, values, update_modified=False)
+
+
+def _single_active_team_for_user(user: str | None) -> str:
+    if not user or not frappe.db.exists("DocType", "Team") or not frappe.db.exists("DocType", "Team User"):
+        return ""
+
+    rows = frappe.db.sql(
+        """
+        select tu.parent
+        from `tabTeam User` tu
+        inner join `tabTeam` t on t.name = tu.parent
+        where tu.user = %s
+          and ifnull(tu.is_active, 1) = 1
+          and ifnull(t.is_active, 1) = 1
+        limit 2
+        """,
+        (user,),
+        as_dict=True,
+    )
+    return rows[0].parent if len(rows) == 1 else ""
+
+
+def create_existing_crm_lead_inbound_call_log(
+    lead,
+    customer_number: str,
+    did_number: str,
+    payload: dict[str, Any],
+    *,
+    target: dict[str, Any],
+):
+    agent_mobile = target.get("agent_mobile") or ""
+    user = target.get("user") or ""
+    doc = frappe.get_doc(
+        {
+            "doctype": "Twilio Call Log",
+            "call_key": make_outbound_call_key(),
+            "source_app": "twilio_click_to_call",
+            "reference_doctype": "CRM Lead",
+            "reference_name": lead.name,
+            "phone_field": "mobile_no" if lead.meta.has_field("mobile_no") else "phone",
+            "user": user,
+            "user_mobile": agent_mobile,
+            "agent_number": agent_mobile,
+            "customer_number": customer_number,
+            "normalized_customer_number": normalize_phone_number(customer_number, default_country_code=get_default_country_code()),
+            "caller_id": did_number,
+            "did_number": did_number,
+            "normalized_did": normalize_phone_number(did_number, default_country_code=get_default_country_code()),
+            "call_flow": "Customer First",
+            "direction": "Incoming",
+            "status": "Agent Ringing" if agent_mobile else "No Answer",
+            "from_number": customer_number,
+            "to_number": did_number,
+            "start_time": frappe.utils.now(),
+            "callback_token": secrets.token_urlsafe(24),
+            "recording_status": "Not Started",
+            "transcript_status": "Not Requested",
+            "ai_status": "Pending",
+            "ai_disposition_status": "Not Requested",
+            "cdr_sync_status": "Not Synced",
+            "currency": "INR",
+            "request_json": json.dumps(_safe_payload(payload), indent=2, default=str),
+            "error_message": f"Inbound route: {target.get('route_type') or 'lead_owner_unassigned'}",
+        }
+    )
+    origin_user = target.get("origin_user") or lead.get("lead_owner") or user
+    _set_request_data(doc, "fallback_origin_user", origin_user)
+    _set_request_data(doc, "fallback_attempted_users", [user] if target.get("is_mapped_agent") and user else [])
+    if target.get("skip_busy_callback_ai_fallback"):
+        _set_request_flag(doc, "skip_busy_callback_ai_fallback", True)
+    if target.get("ai_agent_end_fallback"):
+        _set_request_flag(doc, "ai_agent_end_fallback_attempted", True)
+    apply_provider_payload(doc, payload)
+    doc.crm_lead = lead.name
+    sync_reference_links(doc)
+    doc.insert(ignore_permissions=True)
+    return doc
+
+
+def create_existing_patient_inbound_call_log(
+    patient,
+    customer_number: str,
+    did_number: str,
+    payload: dict[str, Any],
+    *,
+    target: dict[str, Any],
+):
+    agent_mobile = target.get("agent_mobile") or ""
+    user = target.get("user") or ""
+    phone_field = "mobile"
+    for candidate in ("mobile", "mobile_no", "phone", "custom_whatsapp_number"):
+        if patient.meta.has_field(candidate) and patient.get(candidate):
+            phone_field = candidate
+            break
+    doc = frappe.get_doc(
+        {
+            "doctype": "Twilio Call Log",
+            "call_key": make_outbound_call_key(),
+            "source_app": "twilio_click_to_call",
+            "reference_doctype": "Patient",
+            "reference_name": patient.name,
+            "phone_field": phone_field,
+            "user": user,
+            "user_mobile": agent_mobile,
+            "agent_number": agent_mobile,
+            "customer_number": customer_number,
+            "normalized_customer_number": normalize_phone_number(customer_number, default_country_code=get_default_country_code()),
+            "caller_id": did_number,
+            "did_number": did_number,
+            "normalized_did": normalize_phone_number(did_number, default_country_code=get_default_country_code()),
+            "call_flow": "Customer First",
+            "direction": "Incoming",
+            "status": "Agent Ringing" if agent_mobile else "No Answer",
+            "from_number": customer_number,
+            "to_number": did_number,
+            "start_time": frappe.utils.now(),
+            "callback_token": secrets.token_urlsafe(24),
+            "recording_status": "Not Started",
+            "transcript_status": "Not Requested",
+            "ai_status": "Pending",
+            "ai_disposition_status": "Not Requested",
+            "cdr_sync_status": "Not Synced",
+            "currency": "INR",
+            "request_json": json.dumps(_safe_payload(payload), indent=2, default=str),
+            "error_message": f"Inbound route: {target.get('route_type') or 'patient_mapping_unassigned'}",
+        }
+    )
+    origin_user = target.get("origin_user") or user
+    _set_request_data(doc, "fallback_origin_user", origin_user)
+    _set_request_data(doc, "fallback_attempted_users", [user] if target.get("is_mapped_agent") and user else [])
+    if target.get("skip_busy_callback_ai_fallback"):
+        _set_request_flag(doc, "skip_busy_callback_ai_fallback", True)
+    if target.get("ai_agent_end_fallback"):
+        _set_request_flag(doc, "ai_agent_end_fallback_attempted", True)
+    _set_ordered_fallback_route(doc, target)
+    apply_provider_payload(doc, payload)
+    doc.patient = patient.name
+    doc.crm_lead = target.get("crm_lead") or ""
+    sync_reference_links(doc)
+    doc.insert(ignore_permissions=True)
+    return doc
+
+
+def create_unknown_inbound_call_log(
+    lead,
+    customer_number: str,
+    did_number: str,
+    payload: dict[str, Any],
+    *,
+    mapping,
+    target: dict[str, Any],
+):
+    agent_mobile = target.get("agent_mobile") or ""
+    user = target.get("user") or ""
+    doc = frappe.get_doc(
+        {
+            "doctype": "Twilio Call Log",
+            "call_key": make_outbound_call_key(),
+            "source_app": "twilio_click_to_call",
+            "reference_doctype": "CRM Lead",
+            "reference_name": lead.name,
+            "phone_field": "mobile_no" if lead.meta.has_field("mobile_no") else "phone",
+            "user": user,
+            "user_mobile": agent_mobile,
+            "agent_number": agent_mobile,
+            "customer_number": customer_number,
+            "normalized_customer_number": normalize_phone_number(customer_number, default_country_code=get_default_country_code()),
+            "caller_id": did_number,
+            "did_number": did_number,
+            "normalized_did": normalize_phone_number(did_number, default_country_code=get_default_country_code()),
+            "call_flow": "Customer First",
+            "direction": "Incoming",
+            "status": "Agent Ringing" if agent_mobile else "No Answer",
+            "from_number": customer_number,
+            "to_number": did_number,
+            "start_time": frappe.utils.now(),
+            "callback_token": secrets.token_urlsafe(24),
+            "recording_status": "Not Started",
+            "transcript_status": "Not Requested",
+            "ai_status": "Pending",
+            "ai_disposition_status": "Not Requested",
+            "cdr_sync_status": "Not Synced",
+            "currency": "INR",
+            "request_json": json.dumps(_safe_payload(payload), indent=2, default=str),
+            "error_message": f"Inbound route: {target.get('route_type') or 'incoming_did_mapping_unassigned'}",
+        }
+    )
+    _set_request_data(doc, "incoming_mapping", mapping.name)
+    _set_request_data(doc, "incoming_agent_row", target.get("agent_row"))
+    apply_provider_payload(doc, payload)
+    doc.crm_lead = lead.name
+    sync_reference_links(doc)
+    doc.insert(ignore_permissions=True)
+    return doc
+
+
+def update_incoming_assignment(mapping, target: dict[str, Any]) -> None:
+    user = target.get("user")
+    if not user:
+        return
+    now = frappe.utils.now()
+    assigned_primary = target.get("incoming_primary_user") or user
+    frappe.db.set_value("Twilio Incoming Mapping", mapping.name, "last_assigned_agent", assigned_primary, update_modified=True)
+    if target.get("agent_row"):
+        frappe.db.set_value("Twilio Incoming Mapping Agent", target["agent_row"], "last_assigned_at", now, update_modified=True)
+
+
+def publish_callback_notification(call_log, previous, customer_number: str, did_number: str, agent_mobile: str) -> None:
+    if not getattr(call_log, "user", None):
+        return
+    try:
+        frappe.publish_realtime(
+            "twilio_customer_callback",
+            {
+                "call_log": call_log.name,
+                "reference_doctype": call_log.reference_doctype,
+                "reference_name": call_log.reference_name,
+                "crm_lead": call_log.crm_lead,
+                "patient": call_log.patient,
+                "customer_number": customer_number,
+                "did_number": did_number,
+                "agent_mobile": agent_mobile,
+                "agent_user": call_log.user,
+                "previous_call_log": getattr(previous, "name", None),
+            },
+            user=call_log.user,
+            after_commit=True,
+        )
+    except Exception:
+        log_twilio_event(
+            "Inbound callback notification failed",
+            call_log=call_log.name,
+            severity="Warning",
+            payload={"user": call_log.user, "customer_number": customer_number, "did_number": did_number},
+            traceback=frappe.get_traceback(),
+        )
+
+
+def find_existing_inbound_call(payload: dict[str, Any]):
+    identifiers = [
+        ("sip_call_id", _first_value(payload, "SIPCallID", "sip_call_id")),
+        ("call_uuid", _first_value(payload, "CallUUID", "call_uuid", "uuid")),
+        ("request_id", _first_value(payload, "RequestID", "request_id")),
+        ("request_uuid", _first_value(payload, "RequestUUID", "request_uuid")),
+    ]
+    for fieldname, value in identifiers:
+        if not value or not frappe.get_meta("Twilio Call Log").has_field(fieldname):
+            continue
+        name = frappe.db.get_value(
+            "Twilio Call Log",
+            {"source_app": "twilio_click_to_call", "direction": "Incoming", fieldname: value},
+            "name",
+            order_by="creation desc",
+        )
+        if name:
+            return frappe.get_doc("Twilio Call Log", name)
+    return None
+
+
+def update_inbound_call_event(doc, payload: dict[str, Any], *, commit: bool = True) -> None:
+    doc = _lock_call_log(doc)
+    before = snapshot_doc(doc)
+    apply_provider_payload(doc, payload)
+    event = _event_name(payload)
+    status = str(_first_value(payload, "Status", "CallStatus", "status", "call_status") or "").strip().lower()
+    reason = _first_value(payload, "Reason", "HangupCause", "DialHangupCause", "hangup_cause")
+
+    if event == "hangup":
+        answered_seconds = _answered_seconds(doc)
+        if answered_seconds > 0:
+            doc.duration = answered_seconds
+            doc.billsec = answered_seconds
+        doc.status = status_from_provider(
+            {
+                "status": status,
+                "call_status": status,
+                "hangup_cause": reason,
+                "call_flow": doc.call_flow,
+                "answer_time": doc.answer_time,
+                "end_time": doc.end_time,
+                "duration": doc.duration or _safe_int(_first_value(payload, "Duration", "duration")),
+                "billsec": doc.billsec or _safe_int(_first_value(payload, "BillSec", "billsec", "BillSeconds", "bill_seconds")),
+            },
+            previous=doc.status,
+        ) or "Failed"
+        doc.call_status = status or doc.call_status
+        doc.hangup_cause = reason or doc.hangup_cause
+        doc.end_time = _first_value(payload, "EndTime", "end_time") or frappe.utils.now()
+    elif event in {"callinitiated", "startapp", "ring"}:
+        doc.status = "Agent Ringing"
+        doc.call_status = status or doc.call_status
+        doc.start_time = _first_value(payload, "StartTime", "start_time") or doc.start_time or frappe.utils.now()
+
+    _merge_request_payload(doc, payload)
+    doc = save_doc_latest(doc, before)
+    if commit:
+        frappe.db.commit()
+
+
+def mark_inbound_missed(doc, reason: str, payload: dict[str, Any], *, commit: bool = True) -> None:
+    before = snapshot_doc(doc)
+    apply_provider_payload(doc, payload)
+    doc.status = "No Answer"
+    doc.call_status = "missed"
+    doc.hangup_cause = "AGENT_CONSOLE_OFFLINE"
+    doc.error_message = reason
+    doc.end_time = frappe.utils.now()
+    _merge_request_payload(doc, payload)
+    doc = save_doc_latest(doc, before)
+    log_twilio_event(
+        "Inbound callback missed: mapped agent console inactive",
+        call_log=doc.name,
+        severity="Warning",
+        payload={
+            "user": doc.user,
+            "customer_number": doc.customer_number,
+            "did_number": doc.did_number,
+            "reason": reason,
+        },
+    )
+    if commit:
+        frappe.db.commit()
+
+
+def apply_provider_payload(doc, payload: dict[str, Any]) -> None:
+    event = str(_first_value(payload, "Event", "event") or "").strip().lower()
+    values = {
+        "event": _first_value(payload, "Event", "event"),
+        "call_uuid": _first_value(payload, "CallSid", "CallUUID", "call_uuid", "uuid"),
+        "a_leg_uuid": _first_value(payload, "ParentCallSid", "DialALegUUID", "ALegUUID", "a_leg_uuid"),
+        "b_leg_uuid": _first_value(payload, "DialCallSid", "DialBLegUUID", "BLegUUID", "b_leg_uuid"),
+        "request_id": _first_value(payload, "RequestID", "request_id"),
+        "request_uuid": _first_value(payload, "RequestUUID", "request_uuid"),
+        "sip_call_id": _first_value(payload, "SIPCallID", "sip_call_id"),
+        "account_id": _first_value(payload, "AccountSid", "AccountId", "AccountID", "account_id", "ParentAuthID"),
+        "trunk_id": _first_value(payload, "TrunkID", "trunk_id"),
+        "domain": _first_value(payload, "Domain", "domain"),
+        "event_timestamp": _first_value(payload, "Timestamp", "timestamp"),
+        "start_time": _first_value(payload, "StartTime", "start_time"),
+        "answer_time": _first_value(payload, "AnswerTime", "answer_time"),
+        "end_time": _first_value(payload, "EndTime", "end_time"),
+        "duration": _safe_int(_first_value(payload, "Duration", "duration")),
+        "billsec": _safe_int(_first_value(payload, "BillSec", "billsec", "BillSeconds", "bill_seconds")),
+        "ring_time": _safe_int(_first_value(payload, "RingTime", "ring_time")),
+    }
+    if event != "dialaction" or not doc.raw_payload:
+        values["raw_payload"] = json.dumps(_safe_payload(payload), indent=2, default=str)
+    for fieldname, value in values.items():
+        if value not in (None, "") and frappe.get_meta("Twilio Call Log").has_field(fieldname):
+            setattr(doc, fieldname, value)
+
+
+def resolve_inbound_target(previous, settings=None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    mapping = get_user_mapping(previous.user)
+    primary_mobile = _mapping_mobile(mapping, previous.user_mobile)
+
+    if mapping and primary_mobile and _mapping_can_receive(previous.user, mapping):
+        return {"user": previous.user, "agent_mobile": primary_mobile, "route_type": "last_agent", "is_mapped_agent": True}
+
+    for fallback_user in _fallback_users(mapping):
+        fallback_mapping = get_user_mapping(fallback_user)
+        fallback_mobile = _mapping_mobile(fallback_mapping, "")
+        if fallback_mapping and fallback_mobile and _mapping_can_receive(fallback_user, fallback_mapping):
+            return {
+                "user": fallback_user,
+                "agent_mobile": fallback_mobile,
+                "route_type": "fallback_user",
+                "is_mapped_agent": True,
+            }
+
+    ai_target = _ai_agent_end_fallback_target(
+        mapping,
+        route_type="ai_agent_end_fallback",
+        origin_user=previous.user,
+        message="Last agent and fallback users were unavailable; routing to AI agent end fallback.",
+    )
+    if ai_target:
+        return ai_target
+
+    busy_ai_mobile = _busy_callback_ai_fallback_mobile(settings)
+    if busy_ai_mobile:
+        return {"user": previous.user, "agent_mobile": busy_ai_mobile, "route_type": "busy_callback_ai_fallback", "is_mapped_agent": False}
+
+    end_mobile = _end_fallback_mobile(settings)
+    if end_mobile:
+        return {"user": previous.user, "agent_mobile": end_mobile, "route_type": "end_fallback_mobile", "is_mapped_agent": False}
+
+    return {"reason": "Last agent and fallback users were unavailable, and callback fallback is disabled."}
+
+
+def _next_inbound_fallback(doc) -> dict[str, Any]:
+    origin_user = _request_data(doc, "fallback_origin_user") or doc.user
+    attempted = set(_request_data(doc, "fallback_attempted_users") or [])
+    if _request_flag(doc, "strict_ordered_fallback"):
+        lead_owner = str(_request_data(doc, "ordered_lead_owner") or "").strip()
+        for user in _request_data(doc, "ordered_fallback_users") or []:
+            if not user or user in attempted:
+                continue
+            fallback_mapping = get_user_mapping(user)
+            fallback_mobile = _mapping_mobile(fallback_mapping, "")
+            if fallback_mapping and fallback_mobile and _mapping_can_receive(user, fallback_mapping):
+                return {
+                    "user": user,
+                    "agent_mobile": fallback_mobile,
+                    "route_type": "patient_to_lead_owner" if user == lead_owner else "patient_to_lead_owner_fallback_user",
+                    "is_mapped_agent": True,
+                    "origin_user": lead_owner,
+                    "message": "Previous patient/lead route did not answer; trying the next CRM Lead owner route.",
+                }
+
+        ai_user = str(_request_data(doc, "ordered_ai_user") or "").strip()
+        if ai_user and not _request_flag(doc, "ai_agent_end_fallback_attempted"):
+            ai_mapping = get_user_mapping(ai_user)
+            ai_mobile = _mapping_mobile(ai_mapping, "")
+            if ai_mapping and ai_mobile:
+                _set_request_flag(doc, "ai_agent_end_fallback_attempted", True)
+                return {
+                    "user": ai_user,
+                    "agent_mobile": ai_mobile,
+                    "route_type": "patient_to_lead_owner_ai_agent_end_fallback",
+                    "is_mapped_agent": False,
+                    "origin_user": lead_owner,
+                    "ai_agent_end_fallback": True,
+                    "message": "Patient agent, CRM Lead owner, and human fallback users did not answer; routing to AI agent end fallback.",
+                }
+        return {}
+
+    mapping = get_user_mapping(origin_user)
+    for fallback_user in _fallback_users(mapping):
+        if fallback_user in attempted:
+            continue
+        fallback_mapping = get_user_mapping(fallback_user)
+        fallback_mobile = _mapping_mobile(fallback_mapping, "")
+        if fallback_mapping and fallback_mobile and _mapping_can_receive(fallback_user, fallback_mapping):
+            return {
+                "user": fallback_user,
+                "agent_mobile": fallback_mobile,
+                "route_type": "fallback_user",
+                "is_mapped_agent": True,
+                "message": "Mapped agent did not answer; routing to fallback agent.",
+            }
+    ai_target = _ai_agent_end_fallback_target(
+        mapping,
+        route_type="ai_agent_end_fallback",
+        origin_user=origin_user,
+        message="All mapped agents were unavailable; routing to AI agent end fallback.",
+    )
+    if ai_target and not _request_flag(doc, "ai_agent_end_fallback_attempted"):
+        _set_request_flag(doc, "ai_agent_end_fallback_attempted", True)
+        return ai_target
+
+    busy_ai_mobile = "" if _request_flag(doc, "skip_busy_callback_ai_fallback") else _busy_callback_ai_fallback_mobile()
+    if busy_ai_mobile and not _request_flag(doc, "busy_callback_ai_fallback_attempted"):
+        _set_request_flag(doc, "busy_callback_ai_fallback_attempted", True)
+        return {
+            "user": origin_user,
+            "agent_mobile": busy_ai_mobile,
+            "route_type": "busy_callback_ai_fallback",
+            "is_mapped_agent": False,
+            "message": "All mapped agents were unavailable; routing to busy callback AI fallback.",
+        }
+    return {}
+
+
+def _active_agent_mobile(previous) -> str:
+    mapping = get_user_mapping(previous.user)
+    if not mapping:
+        return ""
+    return normalize_phone_number(mapping.get("agent_mobile") or previous.user_mobile, default_country_code=get_default_country_code())
+
+
+def _mapping_mobile(mapping: dict[str, Any] | None, fallback: str = "") -> str:
+    if not mapping:
+        return normalize_phone_number(fallback, default_country_code=get_default_country_code())
+    return normalize_phone_number(mapping.get("agent_mobile") or fallback, default_country_code=get_default_country_code())
+
+
+def _existing_mapping_fields(meta, fields: list[str]) -> list[str]:
+    return [fieldname for fieldname in fields if fieldname == "name" or meta.has_field(fieldname)]
+
+
+def _split_route_values(value: str | None, first: str | None = None) -> list[str]:
+    values = []
+    seen = set()
+    for raw in [first or "", value or ""]:
+        for row in str(raw).replace(",", "\n").splitlines():
+            row = row.strip()
+            if row and row not in seen:
+                values.append(row)
+                seen.add(row)
+    return values
+
+
+def _fallback_users(mapping: dict[str, Any] | None) -> list[str]:
+    if not mapping:
+        return []
+    values = []
+    seen = set()
+    for raw in (mapping.get("fallback_user") or "", mapping.get("fallback_users") or ""):
+        for row in str(raw).replace(",", "\n").splitlines():
+            row = row.strip()
+            if row and row not in seen:
+                values.append(row)
+                seen.add(row)
+    return values
+
+
+def _ai_agent_end_fallback_target(
+    mapping: dict[str, Any] | None,
+    *,
+    route_type: str,
+    origin_user: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    ai_user = str((mapping or {}).get("ai_agent_end_fallback") or "").strip()
+    if not ai_user:
+        return {}
+
+    ai_mapping = get_user_mapping(ai_user)
+    ai_mobile = _mapping_mobile(ai_mapping, "")
+    if not ai_mapping or not ai_mobile:
+        return {}
+
+    target = {
+        "user": ai_user,
+        "agent_mobile": ai_mobile,
+        "route_type": route_type,
+        "is_mapped_agent": False,
+        "origin_user": origin_user or (mapping or {}).get("user") or "",
+        "ai_agent_end_fallback": True,
+    }
+    if message:
+        target["message"] = message
+    return target
+
+
+def _mapping_can_receive(user: str, mapping: dict[str, Any]) -> bool:
+    if not is_agent_console_online(user):
+        return False
+    return not get_mapping_unavailable_reason(mapping)
+
+
+def _start_recording_safely(call_log: str) -> None:
+    try:
+        frappe.enqueue(
+            "twilio_click_to_call.services.recording.start_recording_if_needed",
+            queue="short",
+            timeout=180,
+            call_log=call_log,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Twilio inbound recording start failed")
+
+
+def _inbound_callback_allowed(payload: dict[str, Any], settings, did_number: str) -> bool:
+    configured_dids = set(get_caller_ids(settings))
+    return not configured_dids or bool(did_number and did_number in configured_dids)
+
+def _mark_mapping_busy(user: str | None, call_log: str) -> None:
+    if not user:
+        return
+    mapping_name = frappe.db.get_value("Twilio User Mapping", {"user": user, "enabled": 1}, "name")
+    if not mapping_name:
+        return
+    frappe.db.set_value(
+        "Twilio User Mapping",
+        mapping_name,
+        {
+            "availability_status": "Busy",
+            "accept_calls": 0,
+            "current_call_log": call_log,
+            "last_status_at": frappe.utils.now(),
+        },
+        update_modified=True,
+    )
+
+
+def _end_fallback_mobile(settings=None) -> str:
+    settings = settings or get_settings()
+    if not frappe.utils.cint(getattr(settings, "enable_end_fallback", 0)):
+        return ""
+    return normalize_phone_number(getattr(settings, "end_fallback_mobile", "") or "", default_country_code=get_default_country_code(settings))
+
+
+def _busy_callback_ai_fallback_mobile(settings=None) -> str:
+    settings = settings or get_settings()
+    if not frappe.utils.cint(getattr(settings, "enable_busy_callback_ai_fallback", 0)):
+        return ""
+    return normalize_phone_number(
+        getattr(settings, "busy_callback_ai_fallback_mobile", "") or "",
+        default_country_code=get_default_country_code(settings),
+    )
+
+
+def _dial_agent_xml(call_log, agent_mobile: str, settings) -> str:
+    action_url = build_callback_url(
+        "twilio_click_to_call.api.inbound.dial_action",
+        call_log.name,
+        call_log.callback_token,
+        settings,
+    )
+    event_url = build_callback_url(
+        "twilio_click_to_call.api.inbound.dial_event",
+        call_log.name,
+        call_log.callback_token,
+        settings,
+    )
+    kwargs = {
+        "action": action_url,
+        "method": "POST",
+        "timeout": int(settings.agent_ring_timeout or 30),
+    }
+    if call_log.did_number:
+        kwargs["caller_id"] = provider_phone_number(call_log.did_number)
+    if frappe.utils.cint(getattr(settings, "enable_recording", 0)):
+        kwargs.update(
+            {
+                "record": "record-from-answer-dual"
+                if getattr(settings, "record_channel_type", "stereo") == "stereo"
+                else "record-from-answer",
+                "recording_status_callback": build_callback_url(
+                    "twilio_click_to_call.api.twiml.recording_status",
+                    call_log.name,
+                    call_log.callback_token,
+                    settings,
+                ),
+                "recording_status_callback_method": "POST",
+                "recording_status_callback_event": "completed",
+            }
+        )
+    response = VoiceResponse()
+    dial = response.dial(**kwargs)
+    if call_log.user:
+        dial.client(
+            identity_for_user(call_log.user),
+            status_callback=event_url,
+            status_callback_method="POST",
+            status_callback_event="initiated ringing answered completed",
+        )
+    else:
+        dial.number(provider_phone_number(agent_mobile))
+    return str(response)
+
+def _lock_call_log(doc):
+    """Serialize callbacks for one call so Hangup data cannot be overwritten by DialAction."""
+    if not getattr(doc, "name", None) or getattr(doc, "__islocal", False):
+        return doc
+    frappe.db.sql(
+        "select `name` from `tabTwilio Call Log` where `name` = %s for update",
+        doc.name,
+    )
+    doc.reload()
+    return doc
+
+
+def _answered_seconds(doc) -> int:
+    if not doc.answer_time or not doc.end_time:
+        return 0
+    try:
+        answer_time = frappe.utils.get_datetime(doc.answer_time)
+        end_time = frappe.utils.get_datetime(doc.end_time)
+    except Exception:
+        return 0
+    return max(0, frappe.utils.cint((end_time - answer_time).total_seconds()))
+
+
+def _validate_callback(call_log: str | None, token: str | None):
+    try:
+        validate_twilio_request()
+    except Exception:
+        return None, _payload()
+    payload = _payload()
+    call_log = call_log or payload.get("call_log")
+    token = token or payload.get("token")
+    if not call_log or not token or not frappe.db.exists("Twilio Call Log", call_log):
+        return None, payload
+    doc = frappe.get_doc("Twilio Call Log", call_log)
+    if not doc.callback_token or not secrets_match(doc.callback_token, token):
+        return None, payload
+    return doc, payload
+
+
+def secrets_match(expected: str, received: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(str(expected or ""), str(received or ""))
+
+
+def _dial_failed(status: str) -> bool:
+    normalized = str(status or "").strip().lower().replace("_", "-")
+    return normalized in {"busy", "no-answer", "no answer", "timeout", "failed", "canceled", "cancelled"}
+
+
+def _dial_completed_without_bridge(payload: dict, previous_status: str | None) -> bool:
+    status = str(_first_value(payload, "DialCallStatus", "dial_call_status", "DialStatus", "dial_status", "Status", "status") or "").strip().lower().replace("_", "-")
+    if status != "completed":
+        return False
+    b_leg = _first_value(payload, "DialBLegUUID", "BLegUUID", "DialCallUUID", "dial_b_leg_uuid")
+    dial_action = str(_first_value(payload, "DialAction", "dial_action") or "").strip().lower()
+    return not b_leg and dial_action != "connected" and str(previous_status or "").strip() not in {"Connected", "Completed"}
+
+
+def _should_try_end_fallback(doc) -> bool:
+    if doc.status == "Connected":
+        return False
+    if _request_flag(doc, "skip_busy_callback_ai_fallback"):
+        return False
+    settings = get_settings()
+    end_mobile = _end_fallback_mobile(settings)
+    if not end_mobile:
+        return False
+    if _request_flag(doc, "end_fallback_attempted"):
+        return False
+    current_mobile = normalize_phone_number(doc.get("agent_number") or doc.get("user_mobile"), default_country_code=get_default_country_code(settings))
+    return current_mobile != end_mobile
+
+
+def _request_flag(doc, key: str) -> bool:
+    try:
+        data = json.loads(doc.request_json or "{}")
+        return bool(data.get(key))
+    except Exception:
+        return False
+
+
+def _set_request_flag(doc, key: str, value: Any) -> None:
+    _set_request_data(doc, key, value)
+
+
+def _request_data(doc, key: str):
+    try:
+        data = json.loads(doc.request_json or "{}")
+    except Exception:
+        return None
+    return data.get(key)
+
+
+def _set_request_data(doc, key: str, value: Any) -> None:
+    try:
+        data = json.loads(doc.request_json or "{}")
+    except Exception:
+        data = {}
+    data[key] = value
+    doc.request_json = json.dumps(data, indent=2, default=str)
+
+
+def _merge_request_payload(doc, payload: dict[str, Any]) -> None:
+    try:
+        data = json.loads(doc.request_json or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.update(_safe_payload(payload))
+    doc.request_json = json.dumps(data, indent=2, default=str)
+
+
+def _set_ordered_fallback_route(doc, target: dict[str, Any]) -> None:
+    if not target.get("strict_ordered_fallback"):
+        return
+    _set_request_data(doc, "strict_ordered_fallback", True)
+    _set_request_data(doc, "ordered_fallback_users", target.get("ordered_fallback_users") or [])
+    _set_request_data(doc, "ordered_ai_user", target.get("ordered_ai_user") or "")
+    _set_request_data(doc, "ordered_lead_owner", target.get("lead_owner") or "")
+
+
+def _mark_route_attempted(doc, user: str | None) -> None:
+    if not user:
+        return
+    attempted = _request_data(doc, "fallback_attempted_users") or []
+    if user not in attempted:
+        attempted.append(user)
+    _set_request_data(doc, "fallback_attempted_users", attempted)
+
+
+def _wait_xml() -> str:
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Pause length=\"1\" /></Response>"
+
+
+def _payload() -> dict:
+    payload = {}
+    try:
+        if frappe.request and frappe.request.is_json:
+            payload.update(frappe.request.get_json(silent=True) or {})
+    except Exception:
+        pass
+    payload.update(dict(frappe.form_dict or {}))
+    payload.pop("cmd", None)
+    return payload
+
+
+def _first_value(payload: dict, *keys: str):
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _event_name(payload: dict[str, Any]) -> str:
+    return str(_first_value(payload, "Event", "event", "CallStatus") or "").strip().lower().replace("_", "")
+
+
+def _is_trunk_notification(payload: dict[str, Any]) -> bool:
+    return bool(_event_name(payload) and _first_value(payload, "TrunkID", "trunk_id"))
+
+
+def _safe_int(value) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def _safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_payload = dict(payload or {})
+    safe_payload.pop("cmd", None)
+    for fieldname in (
+        "token",
+        "Token",
+        "callback_token",
+        "inbound_token",
+        "inbound_callback_token",
+    ):
+        safe_payload.pop(fieldname, None)
+    encoded = json.dumps(safe_payload, default=str)
+    if len(encoded) > 64 * 1024:
+        return {
+            "truncated": True,
+            "original_size": len(encoded),
+            "preview": encoded[: 64 * 1024],
+        }
+    return safe_payload
+
+
+def _hangup_xml() -> str:
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup /></Response>"
+
+
+def _xml_response(xml: str):
+    return Response(xml, content_type="text/xml; charset=utf-8")
+
+
+def _plain_response(text: str):
+    return Response(text, content_type="text/plain; charset=utf-8")

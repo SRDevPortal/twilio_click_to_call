@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import frappe
+from frappe import _
+
+from twilio_click_to_call.services.call_log import sync_linked_summaries
+from twilio_click_to_call.services.call_status import is_inbound_missed_call, status_bucket
+from twilio_click_to_call.services.debug_log import log_twilio_event
+from twilio_click_to_call.services.lead_disposition import (
+    sync_call_disposition_to_lead,
+)
+from twilio_click_to_call.services.safety import block_number
+from twilio_click_to_call.services.settings import get_manual_disposition_options
+
+
+TERMINAL_STATUSES = {"Completed", "Failed", "Busy", "No Answer", "Cancelled"}
+CONNECTED_STATUSES = {"Connected", "Completed"}
+MISSED_STATUSES = {"Failed", "Busy", "No Answer", "Cancelled", "Canceled"}
+DND_DISPOSITIONS = {"Wrong Number", "Invalid Number", "Do Not Call"}
+SR_FOLLOWUP_STATUS_DOCTYPE = "SR Followup Status"
+PATIENT_FOLLOWUP_STATUS_FALLBACK_OPTIONS = ["Pending", "Done", "Agent Not Available"]
+PATIENT_FOLLOWUP_STATUS_FIELDS = (
+    "sr_followup_status",
+    "followup_status",
+    "follow_up_status",
+)
+
+
+def get_patient_followup_status_options() -> list[str]:
+    if not frappe.db.exists("DocType", SR_FOLLOWUP_STATUS_DOCTYPE):
+        return PATIENT_FOLLOWUP_STATUS_FALLBACK_OPTIONS[:]
+
+    filters = {}
+    meta = frappe.get_meta(SR_FOLLOWUP_STATUS_DOCTYPE)
+    if meta.has_field("is_active"):
+        filters["is_active"] = 1
+
+    options = frappe.get_all(
+        SR_FOLLOWUP_STATUS_DOCTYPE,
+        filters=filters,
+        pluck="name",
+        order_by="sort_order asc, name asc" if meta.has_field("sort_order") else "name asc",
+    )
+    return options or PATIENT_FOLLOWUP_STATUS_FALLBACK_OPTIONS[:]
+
+
+def save_call_disposition(
+    *,
+    call_log: str,
+    disposition: str | None = None,
+    notes: str = "",
+    lead_status: str | None = None,
+    sr_followup_status: str | None = None,
+    follow_up_datetime: str | None = None,
+    mark_dnd: bool = False,
+) -> dict:
+    doc = frappe.get_doc("Twilio Call Log", call_log)
+    assert_user_can_update_disposition(doc)
+
+    lead_status = (lead_status or "").strip()
+    disposition = (disposition or "").strip()
+    sr_followup_status = (sr_followup_status or "").strip()
+    notes = (notes or "").strip()
+    patient_sync = {"synced": False, "reason": "Reference is not Patient."}
+    if doc.reference_doctype == "Patient":
+        patient_sync = sync_patient_followup_status(doc.reference_name, sr_followup_status)
+        if sr_followup_status and not disposition:
+            disposition = sr_followup_status
+
+    allowed_dispositions = get_manual_disposition_options(
+        reference_doctype=doc.reference_doctype,
+        reference_name=doc.reference_name,
+        lead_status=lead_status,
+    )
+    if doc.reference_doctype != "Patient" and disposition and allowed_dispositions and disposition not in allowed_dispositions:
+        frappe.throw(_("Invalid disposition."))
+
+    doc.disposition = disposition
+    doc.disposition_notes = notes
+    doc.follow_up_datetime = follow_up_datetime
+    doc.disposition_by = frappe.session.user
+    doc.disposition_at = frappe.utils.now()
+
+    if disposition and (mark_dnd or disposition in DND_DISPOSITIONS):
+        block_number(
+            phone_number=doc.customer_number,
+            reason="Wrong Number" if disposition in {"Wrong Number", "Invalid Number"} else "Do Not Call",
+            reference_doctype=doc.reference_doctype,
+            reference_name=doc.reference_name,
+            notes=notes,
+        )
+        doc.dnd_marked = 1
+        mark_reference_dnd(doc, disposition, notes)
+
+    if follow_up_datetime:
+        doc.follow_up_todo = upsert_follow_up_todo(doc, follow_up_datetime)
+
+    doc.save(ignore_permissions=True)
+    if doc.reference_doctype == "Patient":
+        lead_sync = patient_sync
+    else:
+        lead_sync = sync_call_disposition_safely(doc, disposition, lead_status) if (disposition or lead_status) else {"synced": False, "reason": "No CRM status or disposition provided."}
+    update_reference_call_metrics(doc.reference_doctype, doc.reference_name)
+    sync_linked_summaries(doc)
+    add_disposition_comment(doc)
+    frappe.db.commit()
+
+    return {
+        "call_log": doc.name,
+        "disposition": doc.disposition,
+        "sr_followup_status": sr_followup_status,
+        "follow_up_todo": doc.follow_up_todo,
+        "dnd_marked": bool(doc.dnd_marked),
+        "lead_sync": lead_sync,
+    }
+
+
+def sync_patient_followup_status(patient: str | None, sr_followup_status: str | None) -> dict:
+    sr_followup_status = (sr_followup_status or "").strip()
+    if not patient:
+        return {"synced": False, "reason": "Patient reference missing."}
+    if not frappe.db.exists("DocType", "Patient") or not frappe.db.exists("Patient", patient):
+        return {"synced": False, "reason": "Patient not found."}
+    meta = frappe.get_meta("Patient")
+    field = get_patient_followup_status_field(meta)
+    if not field:
+        return {"synced": False, "reason": "Patient Followup Status field not found."}
+    if not sr_followup_status:
+        return {"synced": False, "reason": "No follow-up status provided."}
+
+    options = get_patient_followup_status_options()
+    if sr_followup_status not in options:
+        frappe.throw(_("Invalid follow-up status."))
+
+    values = {field.fieldname: sr_followup_status}
+    status_field = meta.get_field("status")
+    status_options = [row.strip() for row in str((status_field and status_field.options) or "").splitlines() if row.strip()]
+    if not status_options or "Active" in status_options:
+        values["status"] = "Active"
+
+    frappe.db.set_value("Patient", patient, values, update_modified=True)
+    return {
+        "synced": True,
+        "patient": patient,
+        "fieldname": field.fieldname,
+        "sr_followup_status": sr_followup_status,
+        "status": values.get("status"),
+    }
+
+
+def get_patient_followup_status_field(meta=None):
+    meta = meta or frappe.get_meta("Patient")
+    for fieldname in PATIENT_FOLLOWUP_STATUS_FIELDS:
+        field = meta.get_field(fieldname)
+        if field:
+            return field
+    for field in meta.fields:
+        label = (field.label or "").strip().lower().replace("-", " ")
+        if label == "followup status":
+            return field
+    return None
+
+
+def assert_user_can_update_disposition(doc) -> None:
+    if "System Manager" in frappe.get_roles():
+        return
+    if doc.user != frappe.session.user:
+        frappe.throw(_("Not permitted."))
+
+
+def sync_call_disposition_safely(doc, disposition: str | None = None, lead_status: str | None = None) -> dict:
+    try:
+        result = sync_call_disposition_to_lead(doc, disposition, lead_status)
+        if not result.get("synced"):
+            log_twilio_event(
+                "Twilio CRM Lead disposition sync skipped",
+                call_log=doc.name,
+                severity="Warning",
+                process_type="AI Processing",
+                payload={
+                    "reference_doctype": doc.reference_doctype,
+                    "reference_name": doc.reference_name,
+                    "disposition": disposition,
+                    "lead_status": lead_status,
+                    "reason": result.get("reason"),
+                },
+            )
+        return result
+    except Exception as exc:
+        log_twilio_event(
+            "Twilio CRM Lead disposition sync failed",
+            call_log=doc.name,
+            severity="Error",
+            process_type="AI Processing",
+            payload={
+                "reference_doctype": doc.reference_doctype,
+                "reference_name": doc.reference_name,
+                "disposition": disposition,
+                "lead_status": lead_status,
+                "error": str(exc),
+            },
+            traceback=frappe.get_traceback(),
+        )
+        frappe.log_error(frappe.get_traceback(), "Twilio CRM Lead disposition sync failed")
+        return {"synced": False, "reason": str(exc)}
+
+
+def upsert_follow_up_todo(call_log_doc, follow_up_datetime: str) -> str:
+    description = _("Twilio follow-up for {0}").format(call_log_doc.reference_name or call_log_doc.customer_number)
+    if call_log_doc.follow_up_todo and frappe.db.exists("ToDo", call_log_doc.follow_up_todo):
+        todo = frappe.get_doc("ToDo", call_log_doc.follow_up_todo)
+        todo.date = frappe.utils.getdate(follow_up_datetime)
+        todo.description = description
+        todo.save(ignore_permissions=True)
+        return todo.name
+
+    todo = frappe.get_doc(
+        {
+            "doctype": "ToDo",
+            "allocated_to": call_log_doc.user or frappe.session.user,
+            "reference_type": call_log_doc.reference_doctype,
+            "reference_name": call_log_doc.reference_name,
+            "description": description,
+            "date": frappe.utils.getdate(follow_up_datetime),
+            "priority": "Medium",
+            "status": "Open",
+        }
+    )
+    todo.insert(ignore_permissions=True)
+    return todo.name
+
+
+def update_reference_call_metrics(reference_doctype: str | None, reference_name: str | None) -> None:
+    if not reference_doctype or not reference_name or not frappe.db.exists(reference_doctype, reference_name):
+        return
+
+    meta = frappe.get_meta(reference_doctype)
+    fields = {df.fieldname for df in meta.fields}
+    wanted = {
+        "twilio_last_call_status",
+        "twilio_last_call_time",
+        "twilio_last_called_by",
+        "twilio_total_call_attempts",
+        "twilio_connected_call_count",
+        "twilio_missed_call_count",
+        "twilio_last_disposition",
+        "twilio_next_follow_up",
+    }
+    if not fields.intersection(wanted):
+        return
+
+    rows = frappe.get_all(
+        "Twilio Call Log",
+        filters={"reference_doctype": reference_doctype, "reference_name": reference_name},
+        fields=[
+            "name",
+            "status",
+            "call_status",
+            "dial_status",
+            "hangup_cause",
+            "error_message",
+            "call_flow",
+            "direction",
+            "answer_time",
+            "duration",
+            "billsec",
+            "recording_duration",
+            "creation",
+            "user",
+            "disposition",
+            "follow_up_datetime",
+        ],
+        order_by="creation desc",
+        limit_page_length=1,
+    )
+    if not rows:
+        return
+
+    last = rows[0]
+    values = {}
+    if "twilio_last_call_status" in fields:
+        values["twilio_last_call_status"] = call_next_action_label(last)
+    if "twilio_last_call_time" in fields:
+        values["twilio_last_call_time"] = last.creation
+    if "twilio_last_called_by" in fields:
+        values["twilio_last_called_by"] = last.user
+    stats_rows = frappe.db.sql(
+        """
+        select count(*) as total_calls,
+               sum(
+                   `status` in ('Connected', 'Completed')
+                   or coalesce(`billsec`, 0) > 0
+                   or coalesce(`duration`, 0) > 0
+                   or coalesce(`recording_duration`, 0) > 0
+               ) as connected_calls,
+               sum(
+                   `direction` = 'Incoming'
+                   and `status` in ('Failed', 'Busy', 'No Answer', 'Cancelled', 'Canceled')
+               ) as missed_calls
+        from `tabTwilio Call Log`
+        where `reference_doctype` = %s and `reference_name` = %s
+        """,
+        (reference_doctype, reference_name),
+        as_dict=True,
+    )
+    stats = stats_rows[0] if stats_rows else {}
+    if "twilio_total_call_attempts" in fields:
+        values["twilio_total_call_attempts"] = frappe.utils.cint(stats.get("total_calls"))
+    if "twilio_connected_call_count" in fields:
+        values["twilio_connected_call_count"] = frappe.utils.cint(stats.get("connected_calls"))
+    if "twilio_missed_call_count" in fields:
+        values["twilio_missed_call_count"] = frappe.utils.cint(stats.get("missed_calls"))
+
+    last_disposition = frappe.db.get_value(
+        "Twilio Call Log",
+        {
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+            "disposition": ["is", "set"],
+        },
+        "disposition",
+        order_by="creation desc",
+    ) or ""
+    if "twilio_last_disposition" in fields:
+        values["twilio_last_disposition"] = last_disposition
+
+    next_follow_up = frappe.db.get_value(
+        "Twilio Call Log",
+        {
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+            "follow_up_datetime": ["is", "set"],
+        },
+        "follow_up_datetime",
+        order_by="creation desc",
+    )
+    if "twilio_next_follow_up" in fields:
+        values["twilio_next_follow_up"] = next_follow_up
+
+    if values:
+        frappe.db.set_value(reference_doctype, reference_name, values, update_modified=False)
+
+
+def call_next_action_label(call_log_doc) -> str:
+    status = str(call_log_doc.get("status") or "")
+    if status not in {"Cancelled", "Canceled"}:
+        return status
+
+    party = cancelled_call_party(call_log_doc)
+    if party == "Agent":
+        return "Cancelled by Agent"
+    if party == "Customer":
+        return "Cancelled by Customer"
+    return status
+
+
+def cancelled_call_party(call_log_doc) -> str:
+    signal = " ".join(
+        str(call_log_doc.get(fieldname) or "")
+        for fieldname in ("status", "call_status", "dial_status", "hangup_cause", "error_message")
+    ).strip().lower().replace("_", "-")
+    if "cancelled by user" in signal or "canceled by user" in signal:
+        return "Agent"
+    if "agent" in signal and any(token in signal for token in ("cancel", "reject", "decline", "hangup")):
+        return "Agent"
+    if "customer" in signal and any(token in signal for token in ("cancel", "reject", "decline", "hangup")):
+        return "Customer"
+
+    flow = call_log_doc.get("call_flow") or "Customer First"
+    first = "Agent" if flow == "Agent First" else "Customer"
+    second = "Customer" if flow == "Agent First" else "Agent"
+    answered_first = bool(call_log_doc.get("answer_time")) or call_log_doc.get("status") in {
+        "Agent Answered",
+        "Customer Answered",
+        "Agent Ringing",
+        "Connected",
+        "Completed",
+    }
+    return second if answered_first else first
+
+
+def mark_reference_dnd(call_log_doc, disposition: str, notes: str) -> None:
+    if not call_log_doc.reference_doctype or not call_log_doc.reference_name:
+        return
+    if not frappe.db.exists(call_log_doc.reference_doctype, call_log_doc.reference_name):
+        return
+
+    meta = frappe.get_meta(call_log_doc.reference_doctype)
+    fields = {df.fieldname for df in meta.fields}
+    values = {}
+    if "twilio_do_not_call" in fields:
+        values["twilio_do_not_call"] = 1
+    if "twilio_do_not_call_reason" in fields:
+        values["twilio_do_not_call_reason"] = f"{disposition}: {notes}" if notes else disposition
+    if values:
+        frappe.db.set_value(call_log_doc.reference_doctype, call_log_doc.reference_name, values, update_modified=True)
+
+
+def add_disposition_comment(call_log_doc) -> None:
+    if not call_log_doc.reference_doctype or not call_log_doc.reference_name:
+        return
+    if not frappe.db.exists(call_log_doc.reference_doctype, call_log_doc.reference_name):
+        return
+
+    try:
+        ref = frappe.get_doc(call_log_doc.reference_doctype, call_log_doc.reference_name)
+        text = (
+            f"Twilio call disposition: {call_log_doc.disposition or '-'}\n\n"
+            f"Status: {call_log_doc.status}\n"
+            f"Notes: {call_log_doc.disposition_notes or '-'}"
+        )
+        if call_log_doc.follow_up_datetime:
+            text += f"\nFollow-up: {call_log_doc.follow_up_datetime}"
+        ref.add_comment("Comment", text)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Twilio disposition comment failed")
+
+
+def get_reference_call_summary(reference_doctype: str, reference_name: str) -> dict:
+    if not reference_doctype or not reference_name or not frappe.db.exists(reference_doctype, reference_name):
+        frappe.throw(_("Reference document not found."))
+
+    doc = frappe.get_doc(reference_doctype, reference_name)
+    if not doc.has_permission("read"):
+        frappe.throw(_("Not permitted."))
+
+    rows = frappe.get_all(
+        "Twilio Call Log",
+        filters={"reference_doctype": reference_doctype, "reference_name": reference_name},
+        fields=[
+            "name",
+            "creation",
+            "status",
+            "user",
+            "customer_number",
+            "duration",
+            "billsec",
+            "recording_duration",
+            "direction",
+            "call_status",
+            "dial_status",
+            "hangup_cause",
+            "error_message",
+            "disposition",
+            "follow_up_datetime",
+            "recording_url",
+            "ai_disposition",
+        ],
+        order_by="creation desc",
+        limit=10,
+    )
+    total = frappe.db.count(
+        "Twilio Call Log",
+        {"reference_doctype": reference_doctype, "reference_name": reference_name},
+    )
+    connected = frappe.db.count(
+        "Twilio Call Log",
+        {"reference_doctype": reference_doctype, "reference_name": reference_name, "status": ["in", list(CONNECTED_STATUSES)]},
+    )
+    missed_rows = frappe.get_all(
+        "Twilio Call Log",
+        filters={
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+            "direction": "Incoming",
+            "status": ["in", list(MISSED_STATUSES)],
+        },
+        fields=[
+            "status",
+            "direction",
+            "call_status",
+            "dial_status",
+            "hangup_cause",
+            "error_message",
+            "duration",
+            "billsec",
+            "recording_duration",
+        ],
+    )
+    missed = len([row for row in missed_rows if is_inbound_missed_call(row)])
+
+    return {
+        "total": total,
+        "connected": connected,
+        "missed": missed,
+        "rows": rows,
+    }
