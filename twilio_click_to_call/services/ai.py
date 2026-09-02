@@ -35,7 +35,7 @@ MAX_AI_RAW_JSON_CHARS = 64 * 1024
 
 def enqueue_ai_disposition(call_log: str, commit: bool = True) -> None:
     settings = get_settings()
-    if not settings.enable_ai_disposition:
+    if not settings.enabled or not settings.enable_ai_disposition:
         return
 
     frappe.db.set_value(
@@ -80,7 +80,7 @@ def classify_call_log(call_log: str) -> None:
     settings = get_settings()
     doc = frappe.get_doc("Twilio Call Log", call_log)
     transcript = get_call_transcript(doc)
-    if not settings.enable_ai_disposition or not transcript:
+    if not settings.enabled or not settings.enable_ai_disposition or not transcript:
         return
 
     if not doc.get("transcript_text") and frappe.get_meta("Twilio Call Log").has_field("transcript_text"):
@@ -227,6 +227,9 @@ def on_twilio_call_log_update(doc, method: str | None = None) -> None:
 def sync_provider_update_to_click_to_call_log(doc) -> None:
     if doc.get("source_app") == "twilio_click_to_call":
         return
+    settings = get_settings()
+    if not settings.enabled:
+        return
     if not frappe.db.exists("DocType", "Twilio Call Log"):
         return
 
@@ -242,7 +245,7 @@ def sync_provider_update_to_click_to_call_log(doc) -> None:
     frappe.db.set_value("Twilio Call Log", target, values, update_modified=False)
     if values.get("status") in TERMINAL_STATUSES:
         restore_mapping_for_call_log(target)
-    if get_call_transcript(doc):
+    if settings.enable_ai_disposition and get_call_transcript(doc):
         enqueue_ai_disposition(target, commit=False)
 
 
@@ -329,7 +332,8 @@ def restore_mapping_for_call_log(call_log: str) -> None:
 
 
 def maybe_enqueue_from_transcript_update(doc) -> None:
-    if not get_settings().enable_ai_disposition:
+    settings = get_settings()
+    if not settings.enabled or not settings.enable_ai_disposition:
         return
     transcript = get_call_transcript(doc)
     if not transcript:
@@ -379,6 +383,8 @@ def parse_response_json(data: dict[str, Any]) -> dict[str, Any]:
 
 def apply_ai_result(call_log: str, result: dict[str, Any], settings=None) -> None:
     settings = settings or get_settings()
+    if not settings.enabled or not settings.enable_ai_disposition:
+        return
     doc = frappe.get_doc("Twilio Call Log", call_log)
     disposition_rows = get_lead_disposition_rows(doc.reference_doctype, doc.reference_name)
     dispositions = [row["name"] for row in disposition_rows] or get_disposition_options(settings)
@@ -391,7 +397,12 @@ def apply_ai_result(call_log: str, result: dict[str, Any], settings=None) -> Non
         confidence = min(confidence, 0.49)
 
     review_required = confidence < threshold
-    auto_disposed = bool(settings.enable_ai_disposition and not review_required)
+    auto_disposed = bool(
+        settings.enabled
+        and settings.enable_ai_disposition
+        and settings.auto_apply_ai_disposition
+        and not review_required
+    )
     lead_auto_applied = bool(auto_disposed)
     doc.ai_summary = result.get("summary") or ""
     doc.ai_disposition = disposition

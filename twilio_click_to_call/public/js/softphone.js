@@ -1,4 +1,4 @@
-(function () {
+(function(){if(window.dev_server&&window.frappe&&frappe.realtime&&/\.ngrok-(free\.)?dev$|\.ngrok\.io$|\.ngrok\.app$/i.test(window.location.hostname)){frappe.realtime.get_host=function(){return window.location.origin+'/'+frappe.boot.sitename;};}})();(function () {
     "use strict";
 
     let device = null;
@@ -7,9 +7,13 @@
 
     function fetchToken() {
         if (tokenRequest) return tokenRequest;
-        tokenRequest = frappe.call({
+        tokenRequest = Promise.resolve(frappe.call({
             method: "twilio_click_to_call.api.device.get_token",
-        }).then((r) => r.message || {}).finally(() => {
+            // Token registration runs in the background on every Desk page.
+            // Unmapped users are expected (for example, Administrator), so let
+            // the caller decide whether an error should be surfaced.
+            silent: true,
+        })).then((r) => r.message || {}).finally(() => {
             tokenRequest = null;
         });
         return tokenRequest;

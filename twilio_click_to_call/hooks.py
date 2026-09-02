@@ -11,11 +11,11 @@ on_logout = "twilio_click_to_call.twilio_click_to_call.doctype.twilio_user_mappi
 
 app_include_js = [
     "/assets/twilio_click_to_call/js/vendor/twilio.min.js",
-    "/assets/twilio_click_to_call/js/softphone.js",
+    "/assets/twilio_click_to_call/js/softphone.js?v=20260901.1",
     "/assets/twilio_click_to_call/js/click_to_call.js",
     "/assets/twilio_click_to_call/js/list_dialer.js",
     "/assets/twilio_click_to_call/js/call_log.js",
-    "/assets/twilio_click_to_call/js/availability.js?v=20260723.3",
+    "/assets/twilio_click_to_call/js/availability.js?v=20260831.2",
 ]
 
 doctype_js = {

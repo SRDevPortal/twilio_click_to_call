@@ -22,6 +22,10 @@ STALE_RINGING_RECOVERY_LIMIT = 1000
 
 def recover_stale_ringing_calls() -> dict:
     """Release mappings held by pre-bridge calls that never reached a terminal callback."""
+    settings = get_settings()
+    if not settings.enabled:
+        return {"checked": 0, "recovered": 0, "disabled": True}
+
     mappings = frappe.get_all(
         "Twilio User Mapping",
         filters={"enabled": 1, "current_call_log": ["is", "set"]},
@@ -434,6 +438,7 @@ def extract_cdr_rows(response: dict) -> list[dict]:
 
 
 def apply_cdr_to_call_log(doc, cdr: dict, raw_response: dict) -> None:
+    settings = get_settings()
     doc.cdr_json = _bounded_json({"matched_cdr": cdr, "raw_response": raw_response})
     doc.cdr_sync_status = "Synced"
     doc.cdr_synced_at = frappe.utils.now()
@@ -444,7 +449,8 @@ def apply_cdr_to_call_log(doc, cdr: dict, raw_response: dict) -> None:
     doc.currency = cdr.get("currency") or doc.currency or "INR"
     doc.hangup_cause = cdr.get("hangup_cause") or cdr.get("hangup_cause_name") or doc.hangup_cause
     doc.call_status = cdr.get("status") or cdr.get("call_status") or doc.call_status
-    doc.recording_url = cdr.get("recording_url") or cdr.get("record_url") or doc.recording_url
+    if settings.enabled and settings.enable_recording:
+        doc.recording_url = cdr.get("recording_url") or cdr.get("record_url") or doc.recording_url
     doc.status = status_from_cdr(cdr, doc.status)
     doc.save(ignore_permissions=True)
     update_reference_call_metrics(doc.reference_doctype, doc.reference_name)

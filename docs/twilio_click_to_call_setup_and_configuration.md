@@ -6,7 +6,7 @@ This runbook configures the installed twilio_click_to_call app on:
 - Site: eternity.localhost
 - App version: 0.1.0
 
-The app is installed, migrated, asset-built, tested, and disabled. It is standalone and does not depend on vobiz_click_to_call or vobiz_ai.
+The app is installed, migrated, asset-built, tested, and enabled for controlled staging. It is standalone and does not depend on `vobiz_click_to_call` or `vobiz_ai`. The retired `vobiz_click_to_call` app is uninstalled and retained in the bench archive for controlled recovery. The `vobiz_ai` app is intentionally installed because `wa_chat_hub` optionally uses it for patient-routing logic; Twilio Click To Call does not use it.
 
 ## Production warning
 
@@ -92,7 +92,7 @@ In Frappe Desk:
 1. Open CRM Twilio Settings if it exists.
 2. Clear Enabled and save.
 3. Confirm no other custom app creates a Twilio Voice SDK Device for the same user.
-4. Leave Vobiz installed for history and rollback, but do not run two calling integrations for pilot agents.
+4. Confirm vobiz_click_to_call is absent from the site's installed-app list. Keep its source and pre-uninstall backup for controlled rollback.
 
 The app refuses Twilio synchronization while CRM's built-in Twilio integration is enabled.
 
@@ -140,6 +140,23 @@ For later approved use:
 - Sync AI choices from active SR Lead Disposition records.
 - Keep automatic disposition application off until separately accepted.
 - Keep manual review for results below the confidence threshold.
+
+Save while Enabled remains cleared.
+
+### Feature switches are enforced server-side
+
+Each optional operation checks the master Enabled switch and its own feature switch before doing work:
+
+| Switch | When enabled | When disabled |
+| --- | --- | --- |
+| Enable CDR Sync | Manual and scheduled CDR reconciliation runs | CDR jobs return without queueing or calling Twilio |
+| Enable Recording | Twilio recording parameters, recording callbacks, recording jobs, and media streaming run | No recording is requested, stored, streamed, or downloaded |
+| Enable Transcription | Completed recordings are queued for transcription | Transcription callbacks and jobs are ignored; Recording must be enabled first |
+| Enable AI Disposition | Transcript classification and AI result storage run | AI jobs, option sync, and AI callbacks do nothing |
+| Auto Apply AI Disposition | Accepted AI results update CRM disposition/status | AI suggestions are stored for review only; CRM is not changed |
+| Store Raw Callback Payloads | Raw callback payloads are retained | Callback payload storage jobs are not queued |
+| Enable End Fallback / Enable Busy Callback AI Fallback | The corresponding fallback route is eligible | That route is skipped |
+| Enable Idle Auto Offline | Idle agent mappings are taken offline by the configured timeout | Idle mappings are not changed |
 
 Save while Enabled remains cleared.
 
@@ -247,7 +264,7 @@ Do not activate until the implementation plan's final acceptance criteria pass.
 4. Confirm CRM Twilio is disabled.
 5. Apply reviewed Twilio provisioning.
 6. Make one controlled inbound and outbound call.
-7. Disable Vobiz calling without uninstalling apps or deleting history.
+7. Confirm vobiz_click_to_call remains uninstalled and preserve its pre-uninstall backup.
 8. Enable Twilio Settings.
 9. Bring pilot agents online, monitor, and expand gradually.
 
@@ -256,7 +273,7 @@ Do not activate until the implementation plan's final acceptance criteria pass.
 1. Clear Twilio Settings Enabled.
 2. Mark mappings unavailable or offline.
 3. Restore previous TwiML Application and phone-number Voice URLs. Use automated rollback when implemented.
-4. Re-enable Vobiz only with business approval and known-good configuration.
+4. Reinstall Vobiz from retained source and restore backed-up data only with business approval.
 5. Preserve Twilio Call Logs, Error Logs, Vobiz history, and incident evidence.
 6. Record affected Call SIDs, users, timestamps, Twilio Debugger events, and Frappe logs.
 

@@ -10,6 +10,7 @@ from werkzeug.wrappers import Response
 
 from twilio_click_to_call.api.call import restore_mapping_after_call
 from twilio_click_to_call.services.call_log import append_callback, sync_linked_summaries
+from twilio_click_to_call.services.call_log_update import save_doc_latest, snapshot_doc
 from twilio_click_to_call.services.settings import build_callback_url, get_settings
 from twilio_click_to_call.services.webhooks import validate_twilio_request
 
@@ -90,7 +91,7 @@ def outbound():
     doc.a_leg_uuid = parent_sid or doc.a_leg_uuid
     doc.call_uuid = parent_sid or doc.call_uuid
     doc.call_status = params.get("CallStatus") or "initiated"
-    doc.status = "Dialing"
+    doc.status = "Initiated"
     doc.response_json = json.dumps({"browser_leg_sid": parent_sid}, indent=2)
     doc.save(ignore_permissions=True)
     frappe.db.commit()
@@ -128,19 +129,34 @@ def dial_complete(call_log: str | None = None, token: str | None = None):
 
 
 def _apply_status(doc, params: dict, *, is_child: bool = False) -> None:
+    before = snapshot_doc(doc)
     provider_status = str(params.get("CallStatus") or "").strip().lower()
+    # Do not let an out-of-order ringing/initiated callback regress a record
+    # that has already reached a terminal provider outcome.
+    late_nonterminal = (
+        doc.status in {"Completed", "Failed", "Busy", "No Answer"}
+        and provider_status not in TERMINAL
+    )
     call_sid = params.get("CallSid") or ""
     if is_child and call_sid:
         doc.b_leg_uuid = call_sid
     elif call_sid:
         doc.a_leg_uuid = call_sid
     doc.call_uuid = doc.call_uuid or call_sid
-    doc.call_status = provider_status or doc.call_status
-    doc.event = provider_status or doc.event
-    duration = frappe.utils.cint(params.get("CallDuration") or 0)
+    if not late_nonterminal:
+        doc.call_status = provider_status or doc.call_status
+        doc.event = provider_status or doc.event
+
+    duration = frappe.utils.cint(
+        params.get("CallDuration")
+        or params.get("Duration")
+        or params.get("duration")
+        or 0
+    )
     if duration:
         doc.duration = duration
         doc.billsec = duration
+
     mapped = {
         "queued": "Queued",
         "initiated": "Initiated",
@@ -153,15 +169,31 @@ def _apply_status(doc, params: dict, *, is_child: bool = False) -> None:
         "canceled": "Cancelled",
         "cancelled": "Cancelled",
     }.get(provider_status)
-    if mapped:
+    if mapped and not late_nonterminal:
         doc.status = mapped
-    if provider_status == "in-progress":
+    if provider_status == "in-progress" and not late_nonterminal:
         doc.answer_time = doc.answer_time or frappe.utils.now()
+        if doc.start_time and not doc.ring_time:
+            try:
+                doc.ring_time = max(
+                    0,
+                    int(
+                        (
+                            frappe.utils.get_datetime(doc.answer_time)
+                            - frappe.utils.get_datetime(doc.start_time)
+                        ).total_seconds()
+                    ),
+                )
+            except Exception:
+                pass
     if provider_status in TERMINAL:
         doc.end_time = doc.end_time or frappe.utils.now()
+
+    # Save the state before append_callback(). append_callback() updates raw
+    # callback fields atomically and bumps modified; reloading after it would
+    # discard the status/duration changes and re-save stale values.
+    doc = save_doc_latest(doc, before)
     append_callback(doc.name, provider_status or "status", params)
-    doc.reload()
-    doc.save(ignore_permissions=True)
     if provider_status in TERMINAL:
         restore_mapping_after_call(doc.name)
         sync_linked_summaries(doc)
@@ -173,7 +205,8 @@ def _apply_status(doc, params: dict, *, is_child: bool = False) -> None:
 def recording_status(call_log: str | None = None, token: str | None = None):
     params = validate_twilio_request()
     doc = _authorized_doc(call_log or params.get("call_log"), token or params.get("token"))
-    if not doc:
+    settings = get_settings()
+    if not doc or not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.enable_recording):
         return _plain("IGNORED")
     recording_sid = params.get("RecordingSid") or ""
     recording_url = params.get("RecordingUrl") or ""
@@ -185,11 +218,17 @@ def recording_status(call_log: str | None = None, token: str | None = None):
     doc.recording_duration_ms = doc.recording_duration
     doc.recording_status = "Completed" if status_value == "completed" else "Started"
     doc.recording_completed_at = frappe.utils.now() if status_value == "completed" else None
-    if status_value == "completed" and frappe.utils.cint(get_settings().enable_transcription):
+    settings = get_settings()
+    transcription_enabled = (
+        frappe.utils.cint(settings.enabled)
+        and frappe.utils.cint(settings.enable_recording)
+        and frappe.utils.cint(settings.enable_transcription)
+    )
+    if status_value == "completed" and transcription_enabled:
         doc.transcript_status = "Requested"
     doc.save(ignore_permissions=True)
     frappe.db.commit()
-    if status_value == "completed" and frappe.utils.cint(get_settings().enable_transcription):
+    if status_value == "completed" and transcription_enabled:
         frappe.enqueue(
             "twilio_click_to_call.services.transcription.transcribe_recording",
             queue="long",

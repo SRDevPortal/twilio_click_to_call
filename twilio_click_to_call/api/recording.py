@@ -9,6 +9,7 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from werkzeug.wrappers import Response
 
+from twilio_click_to_call.services.recording import provider_recording_url
 from twilio_click_to_call.services.settings import get_auth_credentials, get_settings
 
 MAX_RECORDING_BYTES = 100 * 1024 * 1024
@@ -23,18 +24,21 @@ def download(call_log: str):
     doc = frappe.get_doc("Twilio Call Log", call_log)
     if not _can_access_recording(doc):
         frappe.throw(_("Not permitted."))
-    if not doc.recording_url:
+    if not doc.recording_url and not doc.recording_id:
         frappe.throw(_("Recording URL is not available yet."))
-    if not _is_allowed_recording_url(doc.recording_url):
-        frappe.throw(_("Recording URL is not trusted."))
 
     settings = get_settings()
+    if not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.enable_recording):
+        frappe.throw(_("Twilio Recording is disabled."))
+    media_url = provider_recording_url(doc, settings)
+    if not _is_allowed_recording_url(media_url, doc=doc, settings=settings):
+        frappe.throw(_("Recording URL is not trusted."))
     account_sid, auth_token = get_auth_credentials(settings)
     if not account_sid or not auth_token:
         frappe.throw(_("Twilio Account SID and Auth Token are not configured."))
 
     response = requests.get(
-        _media_url(doc.recording_url),
+        _media_url(media_url),
         auth=(account_sid, auth_token),
         timeout=int(settings.http_timeout or 20),
         stream=True,
@@ -84,12 +88,15 @@ def stream(call_log: str):
     doc = frappe.get_doc("Twilio Call Log", call_log)
     if not _can_access_recording(doc):
         frappe.throw(_("Not permitted."))
-    if not doc.recording_url:
+    if not doc.recording_url and not doc.recording_id:
         frappe.throw(_("Recording URL is not available yet."))
-    if not _is_allowed_recording_url(doc.recording_url):
-        frappe.throw(_("Recording URL is not trusted."))
 
     settings = get_settings()
+    if not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.enable_recording):
+        frappe.throw(_("Twilio Recording is disabled."))
+    media_url = provider_recording_url(doc, settings)
+    if not _is_allowed_recording_url(media_url, doc=doc, settings=settings):
+        frappe.throw(_("Recording URL is not trusted."))
     account_sid, auth_token = get_auth_credentials(settings)
     if not account_sid or not auth_token:
         frappe.throw(_("Twilio Account SID and Auth Token are not configured."))
@@ -100,7 +107,7 @@ def stream(call_log: str):
         headers["Range"] = range_header
 
     response = requests.get(
-        _media_url(doc.recording_url),
+        _media_url(media_url),
         auth=(account_sid, auth_token),
         headers=headers,
         timeout=int(settings.http_timeout or 20),
@@ -174,10 +181,22 @@ def _can_access_recording(doc) -> bool:
     return False
 
 
-def _is_allowed_recording_url(url: str) -> bool:
+def _is_allowed_recording_url(url: str, doc=None, settings=None) -> bool:
     parsed = urlparse(url or "")
-    host = parsed.hostname or ""
-    return parsed.scheme == "https" and (host == "twilio.com" or host.endswith(".twilio.com"))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https":
+        return False
+    if host == "twilio.com" or host.endswith(".twilio.com"):
+        return True
+    # Support Twilio external-storage URLs while preventing arbitrary proxying:
+    # the object path must contain this account and recording SID.
+    if host.endswith(".amazonaws.com") and doc is not None:
+        settings = settings or get_settings()
+        account_sid, _ = get_auth_credentials(settings)
+        recording_id = str(doc.get("recording_id") or "").strip()
+        expected = f"/{account_sid}/{recording_id}"
+        return bool(account_sid and recording_id and parsed.path.startswith(expected))
+    return False
 
 
 def _media_url(url: str) -> str:

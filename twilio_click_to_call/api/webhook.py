@@ -219,7 +219,7 @@ def fallback(call_log: str | None = None, token: str | None = None):
 @rate_limit(limit=300, seconds=60)
 def recording_callback(call_log: str | None = None, token: str | None = None):
     doc, payload = _validate_callback(call_log, token)
-    if not doc:
+    if not doc or not frappe.utils.cint(get_settings().enabled) or not frappe.utils.cint(get_settings().enable_recording):
         return _plain_response("IGNORED")
 
     data = _with_nested_response(payload)
@@ -246,7 +246,12 @@ def recording_callback(call_log: str | None = None, token: str | None = None):
 @rate_limit(limit=300, seconds=60)
 def transcription_callback(call_log: str | None = None, token: str | None = None):
     doc, payload = _validate_callback(call_log, token)
-    if not doc:
+    if (
+        not doc
+        or not frappe.utils.cint(get_settings().enabled)
+        or not frappe.utils.cint(get_settings().enable_recording)
+        or not frappe.utils.cint(get_settings().enable_transcription)
+    ):
         return _plain_response("IGNORED")
 
     data = _with_nested_response(payload)
@@ -257,6 +262,12 @@ def transcription_callback(call_log: str | None = None, token: str | None = None
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
 @rate_limit(limit=300, seconds=60)
 def transcription_event():
+    if (
+        not frappe.utils.cint(get_settings().enabled)
+        or not frappe.utils.cint(get_settings().enable_recording)
+        or not frappe.utils.cint(get_settings().enable_transcription)
+    ):
+        return _plain_response("IGNORED")
     payload = _payload()
     if not _static_event_allowed(payload):
         return _plain_response("IGNORED")
@@ -272,6 +283,13 @@ def transcription_event():
 
 
 def _apply_transcription_payload(doc, data: dict, original_payload: dict | None = None) -> None:
+    settings = get_settings()
+    if (
+        not frappe.utils.cint(settings.enabled)
+        or not frappe.utils.cint(settings.enable_recording)
+        or not frappe.utils.cint(settings.enable_transcription)
+    ):
+        return
     error = _first_value(data, "error", "Error")
     transcript = _first_value(data, "transcription", "transcript", "text", "transcription_text", "Transcript")
     before = snapshot_doc(doc)
@@ -297,7 +315,7 @@ def _apply_transcription_payload(doc, data: dict, original_payload: dict | None 
     frappe.db.commit()
 
     if doc.transcript_status == "Completed":
-        enqueue_ai_disposition(doc.name)
+        _enqueue_ai_if_ready(doc)
 
 
 def _enqueue_ai_if_ready(doc) -> None:
@@ -484,7 +502,8 @@ def _raw_response(content: str, content_type: str, filename: str):
 
 def _append_callback_if_enabled(call_log: str, event: str, payload: dict) -> None:
     try:
-        if not get_settings().store_raw_payloads:
+        settings = get_settings()
+        if not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.store_raw_payloads):
             return
         frappe.enqueue(
             "twilio_click_to_call.services.call_log.append_callback",
@@ -520,6 +539,9 @@ def _log_webhook_event(message: str, doc, payload: dict, severity: str = "Info")
 
 
 def _start_recording_safely(call_log: str) -> None:
+    settings = get_settings()
+    if not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.enable_recording):
+        return
     try:
         frappe.enqueue(
             "twilio_click_to_call.services.recording.start_recording_if_needed",

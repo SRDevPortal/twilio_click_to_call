@@ -361,6 +361,40 @@ class TestAgentConsoleAutoDial(unittest.TestCase):
         self.assertNotIn("accept_calls", activity_source)
         self.assertIn("get_idle_auto_offline_config()", inactive_source)
 
+    def test_availability_menu_keeps_per_option_status_colors(self):
+        availability = AVAILABILITY_JS.read_text(encoding="utf-8")
+        render_start = availability.index("function renderControl(data)")
+        render_end = availability.index("function syncMenuLabels", render_start)
+        render_source = availability[render_start:render_end]
+
+        self.assertIn('.find(".twilio-current-availability-dot")', render_source)
+        self.assertNotIn('.find(".twilio-availability-dot")', render_source)
+        self.assertIn(
+            'class="twilio-availability-dot twilio-current-availability-dot"',
+            availability,
+        )
+        for status, color in (
+            ("Available", "green"),
+            ("Away", "yellow"),
+            ("Offline", "gray"),
+        ):
+            self.assertIn(f'{status}: "{color}"', availability)
+
+    def test_availability_control_loads_directly_on_agent_console(self):
+        availability = AVAILABILITY_JS.read_text(encoding="utf-8")
+        load_start = availability.index("function shouldLoadAvailability()")
+        load_end = availability.index("function shouldTrackDeskActivity()", load_start)
+        load_source = availability[load_start:load_end]
+
+        self.assertIn('window.location.pathname.indexOf("/app") === 0', load_source)
+        self.assertNotIn("twilio-agent-console", load_source)
+        self.assertIn(
+            "return shouldLoadAvailability() && !isAgentConsoleRoute();",
+            availability,
+        )
+        self.assertIn("renderControl(data);", availability)
+        self.assertIn("stopAvailabilityRefreshTimer();", availability)
+
     def test_queue_owner_uses_only_lead_owner_field(self):
         source = CONSOLE_API.read_text(encoding="utf-8")
         start = source.index("\ndef _reference_row(")

@@ -20,6 +20,45 @@ class TestTwilioProviderBoundary(unittest.TestCase):
         self.assertNotIn("from twilio_ai", source)
         self.assertNotIn("import twilio_ai", source)
 
+    def test_standard_workspace_exposes_main_operational_surfaces(self):
+        path = (
+            APP
+            / "twilio_click_to_call"
+            / "workspace"
+            / "twilio_click_to_call"
+            / "twilio_click_to_call.json"
+        )
+        workspace = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(workspace["module"], "Twilio Click To Call")
+        self.assertEqual(workspace["public"], 1)
+        self.assertEqual(workspace["is_hidden"], 0)
+
+        shortcuts = {
+            row["label"]: (row["type"], row["link_to"])
+            for row in workspace["shortcuts"]
+        }
+        self.assertEqual(
+            shortcuts,
+            {
+                "Agent Console": ("Page", "twilio-agent-console"),
+                "Agent Analytics": ("Page", "twilio-agent-analytics"),
+                "Call Logs": ("DocType", "Twilio Call Log"),
+                "Incoming Routing": ("DocType", "Twilio Incoming Mapping"),
+                "User Mapping": ("DocType", "Twilio User Mapping"),
+                "Blocked Numbers": ("DocType", "Twilio Blocked Number"),
+                "Error Logs": ("DocType", "Twilio Error Log"),
+                "Settings": ("DocType", "Twilio Settings"),
+            },
+        )
+        content = json.loads(workspace["content"])
+        content_shortcuts = {
+            row["data"]["shortcut_name"]
+            for row in content
+            if row["type"] == "shortcut"
+        }
+        self.assertEqual(content_shortcuts, set(shortcuts))
+
     def test_settings_define_voice_sdk_credentials_and_opt_in_recording(self):
         path = (
             APP
@@ -62,11 +101,44 @@ class TestTwilioProviderBoundary(unittest.TestCase):
         self.assertIn("device.register()", softphone)
         self.assertIn("currentDevice.connect({params})", softphone)
 
+    def test_background_token_request_is_silent_for_unmapped_desk_users(self):
+        softphone = (APP / "public" / "js" / "softphone.js").read_text(
+            encoding="utf-8"
+        )
+        token_request = softphone[
+            softphone.index("function fetchToken()") : softphone.index(
+                "async function ensureDevice"
+            )
+        ]
+        self.assertIn(
+            'method: "twilio_click_to_call.api.device.get_token"',
+            token_request,
+        )
+        self.assertIn("silent: true", token_request)
+        self.assertIn("ensureDevice(true).catch(() =>", softphone)
+
     def test_public_twiml_callbacks_validate_twilio_signatures(self):
         twiml = (APP / "api" / "twiml.py").read_text(encoding="utf-8")
         inbound = (APP / "api" / "inbound.py").read_text(encoding="utf-8")
         self.assertGreaterEqual(twiml.count("validate_twilio_request()"), 4)
         self.assertIn("validate_twilio_request()", inbound)
+
+    def test_webhook_validator_preserves_translation_function(self):
+        webhooks = (APP / "services" / "webhooks.py").read_text(encoding="utf-8")
+        self.assertIn("auth_token = get_auth_credentials()[1]", webhooks)
+        self.assertNotIn("_, auth_token = get_auth_credentials()", webhooks)
+
+    def test_webhook_signature_does_not_duplicate_query_parameters(self):
+        webhooks = (APP / "services" / "webhooks.py").read_text(encoding="utf-8")
+        request_params = webhooks[
+            webhooks.index("def request_params()") : webhooks.index(
+                "def validate_twilio_request()"
+            )
+        ]
+        self.assertIn("frappe.request.form.to_dict(flat=True)", request_params)
+        self.assertIn("frappe.request.args.to_dict(flat=True)", request_params)
+        self.assertIn("def request_form_params()", webhooks)
+        self.assertIn("signature_params = request_form_params()", webhooks)
 
 
 if __name__ == "__main__":

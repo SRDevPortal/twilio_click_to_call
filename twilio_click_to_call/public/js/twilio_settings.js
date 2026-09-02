@@ -17,20 +17,31 @@ frappe.ui.form.on("Twilio Settings", {
             });
         });
 
-        frm.add_custom_button(__("Sync AI Dispositions"), () => {
-            frappe.call({
-                method: "twilio_click_to_call.twilio_click_to_call.doctype.twilio_settings.twilio_settings.sync_ai_disposition_options",
-                freeze: true,
-                freeze_message: __("Syncing SR Lead Disposition records..."),
-            }).then((r) => {
-                const data = r.message || {};
-                frm.set_value("ai_disposition_options", data.options || "");
-                frm.refresh_field("ai_disposition_options");
-                frappe.show_alert({
-                    message: __("Synced {0} AI disposition options", [data.count || 0]),
-                    indicator: "green",
+        if (frm.doc.enabled && frm.doc.enable_ai_disposition) {
+            frm.add_custom_button(__("Sync AI Dispositions"), () => {
+                frappe.call({
+                    method: "twilio_click_to_call.twilio_click_to_call.doctype.twilio_settings.twilio_settings.sync_ai_disposition_options",
+                    freeze: true,
+                    freeze_message: __("Syncing SR Lead Disposition records..."),
+                }).then((r) => {
+                    const data = r.message || {};
+                    frm.set_value("ai_disposition_options", data.options || "");
+                    frm.refresh_field("ai_disposition_options");
+                    frappe.show_alert({
+                        message: __("Synced {0} AI disposition options", [data.count || 0]),
+                        indicator: "green",
+                    });
                 });
             });
-        });
+        }
+    },
+    enable_recording(frm) {
+        if (!frm.doc.enable_recording && frm.doc.enable_transcription) {
+            frm.set_value("enable_transcription", 0);
+            frappe.show_alert({
+                message: __("Transcription was disabled because Recording is disabled."),
+                indicator: "orange",
+            });
+        }
     },
 });

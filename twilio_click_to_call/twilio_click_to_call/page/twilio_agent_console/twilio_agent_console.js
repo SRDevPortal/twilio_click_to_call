@@ -537,6 +537,13 @@ class TwilioAgentConsole {
 		$(document).on('twilio_availability_changed.twilio-agent-console', (event, data) => {
 			this.render_availability(data || {}, this.state.active_call || {});
 		});
+		$(document).on('twilio_softphone_call_ended.twilio-agent-console', () => {
+			if (!this.is_console_visible()) return;
+			setTimeout(() => {
+				this.refresh_workdesk_live_call();
+				this.load();
+			}, 1000);
+		});
 		$(document).on('page-change.twilio-agent-console route-change.twilio-agent-console', () => {
 			setTimeout(() => {
 				if (!this.is_console_visible()) {
@@ -1485,6 +1492,7 @@ class TwilioAgentConsole {
 			const seconds = Math.max(0, Math.floor((Date.now() - this.state.call_started_at.getTime()) / 1000));
 			const minutes = Math.floor(seconds / 60);
 			this.agent_console_targets('[data-role="timer"]').text(`${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`);
+			if (seconds % 3 === 0) this.refresh_workdesk_live_call();
 		};
 		tick();
 		this.timer = setInterval(tick, 1000);
@@ -2160,13 +2168,6 @@ class TwilioAgentConsole {
 	refresh_workdesk_live_call() {
 		const callLog = this.state.workdesk_live_call_log;
 		if (!callLog || this.state.workdesk_live_polling) return;
-		const active = this.state.active_call || {};
-		if (active.name === callLog) {
-			this.state.workdesk_live_call = active;
-			this.render_workdesk_live_call();
-			return;
-		}
-
 		this.state.workdesk_live_polling = true;
 		frappe.call({
 			method: 'twilio_click_to_call.api.call.get_call_status',

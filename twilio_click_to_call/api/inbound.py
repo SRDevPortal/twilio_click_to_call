@@ -1723,6 +1723,9 @@ def _mapping_can_receive(user: str, mapping: dict[str, Any]) -> bool:
 
 
 def _start_recording_safely(call_log: str) -> None:
+    settings = get_settings()
+    if not frappe.utils.cint(settings.enabled) or not frappe.utils.cint(settings.enable_recording):
+        return
     try:
         frappe.enqueue(
             "twilio_click_to_call.services.recording.start_recording_if_needed",

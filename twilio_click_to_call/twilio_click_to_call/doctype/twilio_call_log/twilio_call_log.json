@@ -7,6 +7,7 @@
   "editable_grid": 1,
   "engine": "InnoDB",
   "field_order": [
+    "overview_tab",
     "call_section",
     "call_key",
     "source_app",
@@ -48,6 +49,7 @@
     "ring_time",
     "cost",
     "currency",
+    "media_ai_tab",
     "recording_section",
     "recording_url",
     "recording_status",
@@ -87,6 +89,7 @@
     "ai_intent",
     "ai_concerns",
     "kamal_involved",
+    "routing_tab",
     "linking_section",
     "caller_classification",
     "crm_lead",
@@ -119,6 +122,7 @@
     "encounter_error",
     "encounter_created_at",
     "encounter_review_required",
+    "diagnostics_tab",
     "raw_section",
     "a_leg_uuid",
     "b_leg_uuid",
@@ -149,6 +153,11 @@
     "last_error"
   ],
   "fields": [
+    {
+      "fieldname": "overview_tab",
+      "fieldtype": "Tab Break",
+      "label": "Overview"
+    },
     {
       "fieldname": "call_section",
       "fieldtype": "Section Break",
@@ -387,6 +396,11 @@
       "label": "Currency"
     },
     {
+      "fieldname": "media_ai_tab",
+      "fieldtype": "Tab Break",
+      "label": "Recording & AI"
+    },
+    {
       "fieldname": "recording_section",
       "fieldtype": "Section Break",
       "label": "Recording"
@@ -605,6 +619,11 @@
       "label": "Kamal Involved"
     },
     {
+      "fieldname": "routing_tab",
+      "fieldtype": "Tab Break",
+      "label": "Routing & Follow-up"
+    },
+    {
       "fieldname": "linking_section",
       "fieldtype": "Section Break",
       "label": "Lead / Patient"
@@ -808,6 +827,11 @@
       "fieldname": "encounter_review_required",
       "fieldtype": "Check",
       "label": "Encounter Review Required"
+    },
+    {
+      "fieldname": "diagnostics_tab",
+      "fieldtype": "Tab Break",
+      "label": "Diagnostics"
     },
     {
       "fieldname": "raw_section",

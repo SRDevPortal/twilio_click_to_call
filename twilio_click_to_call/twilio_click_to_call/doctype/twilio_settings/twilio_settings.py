@@ -57,13 +57,16 @@ class TwilioSettings(Document):
         self.record_channel_type = self.record_channel_type or "stereo"
         self.recording_time_limit = self.recording_time_limit or self.max_call_duration or 3600
         self.transcription_model = self.transcription_model or "gpt-4o-mini-transcribe"
+        if self.enable_transcription and not self.enable_recording:
+            frappe.throw(_("Enable Recording before enabling Transcription."))
         self.openai_model = self.openai_model or "gpt-4.1-mini"
         self.ai_confidence_threshold = self.ai_confidence_threshold or 0.75
         if self.meta.has_field("ai_disposition_system_prompt"):
             self.ai_disposition_system_prompt = (
                 self.get("ai_disposition_system_prompt") or DEFAULT_AI_DISPOSITION_SYSTEM_PROMPT
             ).strip()
-        self.sync_ai_disposition_options()
+        if self.enable_ai_disposition:
+            self.sync_ai_disposition_options()
 
         if not self.enabled:
             return
@@ -132,6 +135,8 @@ def sync_ai_disposition_options() -> dict:
         frappe.throw(_("Not permitted."))
 
     settings = frappe.get_single("Twilio Settings")
+    if not settings.enabled or not settings.enable_ai_disposition:
+        frappe.throw(_("Twilio AI Disposition is disabled."))
     options = settings.sync_ai_disposition_options()
     settings.save(ignore_permissions=True)
     frappe.db.commit()

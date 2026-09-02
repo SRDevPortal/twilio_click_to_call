@@ -95,7 +95,10 @@ class TestServerSafetyGuards(unittest.TestCase):
         self.assertIn("statusPollInFlight", click_to_call)
         self.assertIn("sync_provider: 0", agent_console)
         self.assertIn("this.load_in_flight", agent_console)
-        self.assertIn('route[0] !== "twilio-agent-console"', availability)
+        self.assertIn(
+            "return shouldLoadAvailability() && !isAgentConsoleRoute();",
+            availability,
+        )
 
     def test_cdr_jobs_are_bounded_and_deduplicated(self):
         cdr = CDR.read_text(encoding="utf-8")

@@ -8,6 +8,7 @@ import frappe
 import requests
 
 from twilio_click_to_call.services.ai import enqueue_ai_disposition
+from twilio_click_to_call.services.recording import provider_recording_url
 from twilio_click_to_call.services.settings import (
     get_auth_credentials,
     get_openai_api_key,
@@ -18,25 +19,32 @@ from twilio_click_to_call.services.settings import (
 def transcribe_recording(call_log: str) -> None:
     doc = frappe.get_doc("Twilio Call Log", call_log)
     settings = get_settings()
-    if not settings.enable_transcription or not doc.recording_url:
+    if (
+        not settings.enabled
+        or not settings.enable_recording
+        or not settings.enable_transcription
+        or not doc.recording_url
+    ):
         return
     api_key = get_openai_api_key(settings)
     if not api_key:
         _fail(doc, "OpenAI API key is not configured.")
         return
-    host = (urlsplit(doc.recording_url).hostname or "").lower()
-    if host not in {"api.twilio.com", "voice.twilio.com"} and not host.endswith(".twilio.com"):
-        _fail(doc, "Recording URL is not hosted by Twilio.")
+    audio_url = provider_recording_url(doc, settings)
+    host = (urlsplit(audio_url).hostname or "").lower()
+    is_twilio_media = host in {"api.twilio.com", "voice.twilio.com"} or host.endswith(".twilio.com")
+    is_external_media = host.endswith(".amazonaws.com")
+    if not is_twilio_media and not is_external_media:
+        _fail(doc, "Recording URL is not hosted by Twilio or an approved external storage host.")
         return
 
     account_sid, auth_token = get_auth_credentials(settings)
-    audio_url = doc.recording_url
     if not audio_url.endswith((".mp3", ".wav")):
         audio_url += ".mp3"
     try:
         audio = requests.get(
             audio_url,
-            auth=(account_sid, auth_token),
+            auth=(account_sid, auth_token) if is_twilio_media else None,
             timeout=int(settings.http_timeout or 20) * 3,
         )
         audio.raise_for_status()
@@ -66,7 +74,10 @@ def transcribe_recording(call_log: str) -> None:
     doc.transcript_error = ""
     doc.save(ignore_permissions=True)
     frappe.db.commit()
-    if frappe.utils.cint(settings.enable_ai_disposition):
+    if (
+        frappe.utils.cint(settings.enabled)
+        and frappe.utils.cint(settings.enable_ai_disposition)
+    ):
         enqueue_ai_disposition(doc.name)
 
 

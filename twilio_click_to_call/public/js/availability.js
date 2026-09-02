@@ -54,12 +54,21 @@
         return window.location && window.location.pathname === "/app/home";
     }
 
-    function shouldLoadAvailability() {
-        if (!(window.location && window.location.pathname && window.location.pathname.indexOf("/app") === 0)) {
-            return false;
-        }
+    function isAgentConsoleRoute() {
         const route = currentRoute();
-        return route[0] !== "twilio-agent-console";
+        return route[0] === "twilio-agent-console";
+    }
+
+    function shouldLoadAvailability() {
+        return Boolean(
+            window.location &&
+            window.location.pathname &&
+            window.location.pathname.indexOf("/app") === 0
+        );
+    }
+
+    function shouldTrackDeskActivity() {
+        return shouldLoadAvailability() && !isAgentConsoleRoute();
     }
 
     function init() {
@@ -85,8 +94,13 @@
             currentAvailability = data;
             ensureStyles();
             renderControl(data);
-            startActivityTracking();
-            startAvailabilityRefreshTimer();
+            if (shouldTrackDeskActivity()) {
+                startActivityTracking();
+                startAvailabilityRefreshTimer();
+            } else {
+                stopActivityTracking(false);
+                stopAvailabilityRefreshTimer();
+            }
         }).always(() => {
             availabilityRequest = null;
         });
@@ -286,7 +300,7 @@
         const color = COLORS[status] || "gray";
         $control.find(".twilio-availability-label").text(status_label(status));
         $control
-            .find(".twilio-availability-dot")
+            .find(".twilio-current-availability-dot")
             .removeClass("twilio-dot-green twilio-dot-orange twilio-dot-yellow twilio-dot-gray")
             .addClass(`twilio-dot-${color}`);
 
@@ -313,7 +327,7 @@
         const $control = $(`
             <div class="twilio-availability-control" id="twilio-availability-control">
                 <button type="button" class="twilio-availability-button">
-                    <span class="twilio-availability-dot"></span>
+                    <span class="twilio-availability-dot twilio-current-availability-dot"></span>
                     <span class="twilio-availability-label"></span>
                     <i class="fa fa-angle-down"></i>
                 </button>
@@ -510,14 +524,19 @@
     }
 
     function startAvailabilityRefreshTimer() {
-        clearInterval(availabilityRefreshTimer);
+        stopAvailabilityRefreshTimer();
         availabilityRefreshTimer = setInterval(() => {
-            if (!shouldLoadAvailability() || document.visibilityState === "hidden") return;
+            if (!shouldTrackDeskActivity() || document.visibilityState === "hidden") return;
             if (currentAvailability && currentAvailability.availability_status === "Away") {
                 showBreakLock(breakStartedAt(safeNumber(currentAvailability.last_status_epoch_ms)));
             }
             refresh();
         }, AVAILABILITY_REFRESH_MS);
+    }
+
+    function stopAvailabilityRefreshTimer() {
+        clearInterval(availabilityRefreshTimer);
+        availabilityRefreshTimer = null;
     }
 
     function showBreakLock(startedAt) {
@@ -567,7 +586,7 @@
     }
 
     function startActivityTracking() {
-        if (!currentAvailability || !currentAvailability.is_mapped || !shouldLoadAvailability()) return;
+        if (!currentAvailability || !currentAvailability.is_mapped || !shouldTrackDeskActivity()) return;
         bindActivityEvents();
         const wasTracking = trackingActivity;
         trackingActivity = true;
@@ -596,7 +615,7 @@
             trackingActivity &&
             currentAvailability &&
             currentAvailability.is_mapped &&
-            shouldLoadAvailability() &&
+            shouldTrackDeskActivity() &&
             document.visibilityState !== "hidden" &&
             currentAvailability.availability_status !== "Away" &&
             (!idleRuleEnabled || globalActivityAge() < activityIdleMs()) &&
@@ -667,7 +686,7 @@
     }
 
     function noteActivity() {
-        if (!currentAvailability || !currentAvailability.is_mapped || !shouldLoadAvailability()) return;
+        if (!currentAvailability || !currentAvailability.is_mapped || !shouldTrackDeskActivity()) return;
         touchGlobalActivity();
         if (currentAvailability.availability_status === "Away") {
             resetActivityIdleTimer();
@@ -689,7 +708,7 @@
 
     function resetActivityIdleTimer() {
         clearTimeout(activityIdleTimer);
-        if (!trackingActivity || idleInactive || !shouldLoadAvailability()) return;
+        if (!trackingActivity || idleInactive || !shouldTrackDeskActivity()) return;
         if (!isIdleAutoOfflineEnabled()) return;
         const age = globalActivityAge();
         const delay = Math.max(1000, activityIdleMs() - age);
@@ -756,7 +775,7 @@
             stopActivityTracking(false);
             return;
         }
-        if (currentAvailability && currentAvailability.is_mapped && shouldLoadAvailability()) {
+        if (currentAvailability && currentAvailability.is_mapped && shouldTrackDeskActivity()) {
             startActivityTracking();
         }
     }

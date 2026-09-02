@@ -367,6 +367,12 @@ def sync_live_call_if_finished(doc) -> None:
         before = snapshot_doc(doc)
         doc.status = _terminal_status_from_provider(provider_status, doc.status, doc)
         doc.call_status = provider_status
+        provider_duration = frappe.utils.cint(
+            response.get("duration") or response.get("billsec") or 0
+        )
+        if provider_duration:
+            doc.duration = provider_duration
+            doc.billsec = provider_duration
         doc.end_time = doc.end_time or frappe.utils.now()
         doc.response_json = merge_json(doc.response_json, {"live_status_response": response})
         doc = save_doc_latest(doc, before)
@@ -424,8 +430,14 @@ def cancel_call(call_log: str) -> dict[str, Any]:
     if "System Manager" not in frappe.get_roles() and doc.user != frappe.session.user:
         frappe.throw(_("Not permitted."))
 
+    # The browser can still show the Stop Call button briefly after the
+    # customer hangs up. Reconcile with Twilio before cancelling so a
+    # completed provider call cannot be overwritten as user-cancelled.
+    sync_live_call_if_finished(doc)
+    doc = frappe.get_doc("Twilio Call Log", call_log)
     if doc.status in TERMINAL_STATUSES:
         return {"status": doc.status, "message": _("Call is already finished.")}
+
 
     call_uuid = doc.call_uuid or doc.a_leg_uuid or doc.b_leg_uuid
     if call_uuid:

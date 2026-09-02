@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 from typing import Any
 
 import frappe
 
 from twilio_click_to_call.services.client import TwilioClient, extract_provider_id
-from twilio_click_to_call.services.settings import build_callback_url, get_settings
+from twilio_click_to_call.services.settings import (
+    build_callback_url,
+    get_auth_credentials,
+    get_settings,
+)
 
 
 def start_recording_if_needed(call_log: str) -> None:
     settings = get_settings()
-    if not settings.enable_recording:
+    if not settings.enabled or not settings.enable_recording:
         return
 
     doc = frappe.get_doc("Twilio Call Log", call_log)
@@ -84,6 +89,31 @@ def start_recording_if_needed(call_log: str) -> None:
     frappe.db.commit()
 
 
+def provider_recording_url(doc, settings=None) -> str:
+    """Return an authenticated Twilio media URL when a Recording SID is available.
+
+    Twilio callbacks may expose recordings through an S3-backed URL. The
+    Recording SID is stable, so fetching through the Twilio API avoids rejecting
+    valid provider storage URLs and preserves Twilio authentication.
+    """
+    settings = settings or get_settings()
+    account_sid, _ = get_auth_credentials(settings)
+    recording_id = str(doc.get("recording_id") or "").strip()
+    stored_url = str(doc.get("recording_url") or "").strip()
+    stored_host = stored_url.split("/", 3)[2].lower() if stored_url.startswith("https://") else ""
+    # External-storage accounts return the playable media URL (for example an
+    # S3 URL). Preserve it; the standard Twilio .mp3 endpoint returns 404 for
+    # recordings that are not stored in Twilio.
+    if stored_url and stored_host not in {"api.twilio.com", "voice.twilio.com"} and not stored_host.endswith(".twilio.com"):
+        return stored_url
+    if account_sid and recording_id.startswith("RE"):
+        return (
+            f"https://api.twilio.com/2010-04-01/Accounts/"
+            f"{quote(account_sid, safe='')}/Recordings/{quote(recording_id, safe='')}.mp3"
+        )
+    return stored_url
+
+
 def build_recording_payload(call_log: str, token: str, settings) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "time_limit": int(settings.recording_time_limit or settings.max_call_duration or 3600),
@@ -98,7 +128,7 @@ def build_recording_payload(call_log: str, token: str, settings) -> dict[str, An
         "callback_method": "POST",
     }
 
-    if settings.enable_transcription:
+    if settings.enabled and settings.enable_recording and settings.enable_transcription:
         payload.update(
             {
                 "transcription_model": settings.transcription_model or "gpt-4o-mini-transcribe",

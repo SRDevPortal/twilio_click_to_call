@@ -16,7 +16,7 @@
 
 Deliver a standalone Frappe v15 click-to-call application backed by Twilio Programmable Voice. Agents must place and receive calls through one browser softphone, while signed Twilio callbacks remain authoritative for call state.
 
-The app must not import from, write to, migrate, or delete data belonging to vobiz_click_to_call or vobiz_ai. Existing Vobiz settings and history remain available for rollback. Frappe CRM's built-in Twilio integration must remain disabled while this app is active.
+The app must not import from or write to vobiz_click_to_call or vobiz_ai. The vobiz_click_to_call site app has been uninstalled after a backup; its source directory is retained for controlled recovery. Frappe CRM's built-in Twilio integration must remain disabled while this app is active.
 
 ## Current baseline
 
@@ -29,7 +29,8 @@ Completed on eternity.localhost:
 - [x] Current server test suite passes: 128 tests.
 - [x] Twilio Settings, recording, transcription, and AI disposition are disabled by default.
 - [x] CRM Twilio Settings is disabled.
-- [x] Existing Vobiz applications remain installed and unchanged.
+- [x] vobiz_click_to_call was backed up and uninstalled from the site; its source directory remains available.
+- [x] vobiz_ai was backed up, uninstalled, and archived; WA Chat Hub's optional Vobiz patient-routing branch is no longer active.
 
 Implemented surfaces include Twilio Settings, User Mapping, Incoming Mapping, Blocked Number, Agent Attendance Log, Call Log, Error Log, Voice SDK tokens, outbound TwiML, inbound routing, signed callbacks, recording proxying, CDR recovery, Agent Console, analytics, dispositions, and click-to-call controls.
 
@@ -136,7 +137,7 @@ Exit: acceptance evidence, monitoring owner, rollback owner, and cutover approva
 5. Validate User Mappings and Incoming Mappings.
 6. Review provisioning preview and every affected resource SID.
 7. Apply provisioning and make one controlled outbound and inbound call.
-8. Disable Vobiz calling without uninstalling apps or deleting data.
+8. Confirm vobiz_click_to_call remains uninstalled and retain its pre-uninstall backup.
 9. Enable Twilio Settings and bring pilot agents online.
 10. Expand only after the pilot monitoring window passes.
 
@@ -146,7 +147,7 @@ Triggers include elevated failure rate, missing callbacks, duplicate Devices, wr
 
 1. Disable Twilio Settings and mark Twilio users offline.
 2. Restore saved TwiML Application and number webhook values. Until automated rollback exists, use the pre-cutover export.
-3. Re-enable Vobiz only with business approval.
+3. Reinstall Vobiz from the retained source and restore its backed-up data only with business approval.
 4. Preserve Twilio logs, Vobiz records, and audit evidence.
 5. Capture Call SIDs, timestamps, users, Twilio Debugger events, and Frappe logs.
 

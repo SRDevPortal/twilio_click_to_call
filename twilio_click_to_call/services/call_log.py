@@ -112,7 +112,7 @@ def append_callback(call_log: str, event: str, payload: dict) -> None:
     rows.append({"event": event, "received_at": frappe.utils.now(), "payload": safe_payload})
     doc.raw_callbacks = as_json(rows[-50:])
     doc.raw_payload = as_json({"callbacks": rows[-50:]})
-    doc.save(ignore_permissions=True)
+    frappe.db.set_value("Twilio Call Log", call_log, {"raw_callbacks": doc.raw_callbacks, "raw_payload": doc.raw_payload}, update_modified=True)
 
 
 def sync_reference_links(call_log_doc) -> None:

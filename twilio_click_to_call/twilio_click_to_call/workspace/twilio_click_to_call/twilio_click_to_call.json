@@ -1,0 +1,204 @@
+{
+ "charts": [],
+ "content": "[{\"id\":\"twilio_header\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">Twilio Click To Call</span>\",\"col\":12}},{\"id\":\"twilio_agent_console\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Agent Console\",\"col\":3}},{\"id\":\"twilio_agent_analytics\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Agent Analytics\",\"col\":3}},{\"id\":\"twilio_call_logs\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Call Logs\",\"col\":3}},{\"id\":\"twilio_incoming_routing\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Incoming Routing\",\"col\":3}},{\"id\":\"twilio_configuration_header\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">Configuration and Operations</span>\",\"col\":12}},{\"id\":\"twilio_user_mapping\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"User Mapping\",\"col\":3}},{\"id\":\"twilio_blocked_numbers\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Blocked Numbers\",\"col\":3}},{\"id\":\"twilio_error_logs\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Error Logs\",\"col\":3}},{\"id\":\"twilio_settings\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Settings\",\"col\":3}}]",
+ "creation": "2026-08-31 00:00:00.000000",
+ "custom_blocks": [],
+ "docstatus": 0,
+ "doctype": "Workspace",
+ "for_user": "",
+ "hide_custom": 0,
+ "icon": "phone",
+ "idx": 0,
+ "indicator_color": "blue",
+ "is_hidden": 0,
+ "label": "Twilio Click To Call",
+ "links": [
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Calling",
+   "link_count": 0,
+   "link_type": "Page",
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Agent Console",
+   "link_count": 0,
+   "link_to": "twilio-agent-console",
+   "link_type": "Page",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Agent Analytics",
+   "link_count": 0,
+   "link_to": "twilio-agent-analytics",
+   "link_type": "Page",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Call Logs",
+   "link_count": 0,
+   "link_to": "Twilio Call Log",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Configuration",
+   "link_count": 0,
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Incoming Routing",
+   "link_count": 0,
+   "link_to": "Twilio Incoming Mapping",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "User Mapping",
+   "link_count": 0,
+   "link_to": "Twilio User Mapping",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Blocked Numbers",
+   "link_count": 0,
+   "link_to": "Twilio Blocked Number",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Settings",
+   "link_count": 0,
+   "link_to": "Twilio Settings",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Monitoring",
+   "link_count": 0,
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Error Logs",
+   "link_count": 0,
+   "link_to": "Twilio Error Log",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Agent Attendance",
+   "link_count": 0,
+   "link_to": "Twilio Agent Attendance Log",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  }
+ ],
+ "modified": "2026-08-31 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Twilio Click To Call",
+ "name": "Twilio Click To Call",
+ "number_cards": [],
+ "owner": "Administrator",
+ "parent_page": "",
+ "public": 1,
+ "quick_lists": [],
+ "roles": [],
+ "sequence_id": 30,
+ "shortcuts": [
+  {
+   "doc_view": "",
+   "icon": "phone",
+   "label": "Agent Console",
+   "link_to": "twilio-agent-console",
+   "type": "Page"
+  },
+  {
+   "doc_view": "",
+   "icon": "line-chart",
+   "label": "Agent Analytics",
+   "link_to": "twilio-agent-analytics",
+   "type": "Page"
+  },
+  {
+   "doc_view": "List",
+   "icon": "phone-call",
+   "label": "Call Logs",
+   "link_to": "Twilio Call Log",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "List",
+   "icon": "git-branch",
+   "label": "Incoming Routing",
+   "link_to": "Twilio Incoming Mapping",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "List",
+   "icon": "users",
+   "label": "User Mapping",
+   "link_to": "Twilio User Mapping",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "List",
+   "icon": "slash",
+   "label": "Blocked Numbers",
+   "link_to": "Twilio Blocked Number",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "List",
+   "icon": "alert-triangle",
+   "label": "Error Logs",
+   "link_to": "Twilio Error Log",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "",
+   "icon": "settings",
+   "label": "Settings",
+   "link_to": "Twilio Settings",
+   "type": "DocType"
+  }
+ ],
+ "title": "Twilio Click To Call"
+}
