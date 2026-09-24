@@ -15,7 +15,7 @@ app_include_js = [
     "/assets/twilio_click_to_call/js/click_to_call.js",
     "/assets/twilio_click_to_call/js/list_dialer.js",
     "/assets/twilio_click_to_call/js/call_log.js",
-    "/assets/twilio_click_to_call/js/availability.js?v=20260831.2",
+    "/assets/twilio_click_to_call/js/availability.js?v=20260924.1",
 ]
 
 doctype_js = {

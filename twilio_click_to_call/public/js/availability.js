@@ -44,6 +44,7 @@
     let trackingActivity = false;
     let idleInactive = false;
     let lastRouteKey = "";
+    let navbarObserver = null;
 
     function currentRoute() {
         if (!window.frappe || !frappe.get_route) return [];
@@ -76,7 +77,17 @@
         bindBreakSyncEvents();
         if (!shouldLoadAvailability()) {
             stopActivityTracking(true);
+            stopAvailabilityRefreshTimer();
             return;
+        }
+        if (!navbarObserver && window.MutationObserver && document.body) {
+            navbarObserver = new MutationObserver(() => {
+                if (shouldLoadAvailability() && currentAvailability && currentAvailability.is_mapped
+                    && $(".navbar .navbar-nav").length && !$("#twilio-availability-control").length) {
+                    renderControl(currentAvailability);
+                }
+            });
+            navbarObserver.observe(document.body, { childList: true, subtree: true });
         }
         refresh();
     }
@@ -96,11 +107,11 @@
             renderControl(data);
             if (shouldTrackDeskActivity()) {
                 startActivityTracking();
-                startAvailabilityRefreshTimer();
             } else {
                 stopActivityTracking(false);
-                stopAvailabilityRefreshTimer();
             }
+            // The console owns attendance heartbeats, but its navbar still needs status updates.
+            startAvailabilityRefreshTimer();
         }).always(() => {
             availabilityRequest = null;
         });
@@ -359,7 +370,7 @@
             $control.toggleClass("open");
         });
 
-        $(document).on("click.twilio-availability", () => {
+        $(document).off("click.twilio-availability").on("click.twilio-availability", () => {
             $control.removeClass("open");
         });
 
@@ -526,7 +537,7 @@
     function startAvailabilityRefreshTimer() {
         stopAvailabilityRefreshTimer();
         availabilityRefreshTimer = setInterval(() => {
-            if (!shouldTrackDeskActivity() || document.visibilityState === "hidden") return;
+            if (!shouldLoadAvailability() || document.visibilityState === "hidden") return;
             if (currentAvailability && currentAvailability.availability_status === "Away") {
                 showBreakLock(breakStartedAt(safeNumber(currentAvailability.last_status_epoch_ms)));
             }
@@ -791,13 +802,12 @@
     $(document).on("twilio_refresh_availability", refresh);
     $(document).on("page-change route-change", handleRouteChange);
 
-    if (frappe.ready) {
-        frappe.ready(init);
-    } else {
-        $(init);
-    }
+    if (frappe.ready) frappe.ready(init);
+    // Desk does not always run the website-ready callback queue.
+    $(init);
 
     window.twilio_click_to_call = window.twilio_click_to_call || {};
+    window.twilio_click_to_call.refresh_availability = init;
     window.twilio_click_to_call.get_availability = function () {
         return currentAvailability;
     };
